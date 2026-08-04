@@ -1,0 +1,61 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+ENV/
+dist/
+build/
+*.egg
+
+# ===== Node / Next.js =====
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# ===== Environment =====
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ===== Database =====
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== Media / outputs =====
+media/
+videos/
+output/
+*.mp4
+*.mov
+*.gif
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Project =====
+data/
+tmp/
+*.log
