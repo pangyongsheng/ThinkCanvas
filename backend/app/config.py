@@ -1,12 +1,19 @@
 """Application settings loaded from environment variables."""
 from functools import lru_cache
+from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Project root `.env` is the single source of truth (gitignored).
+# backend/app/config.py -> backend/app/ -> backend/ -> project root
+project_root = Path(__file__).resolve().parent.parent.parent
+_ENV_FILE = project_root / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -17,6 +24,21 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+asyncpg://thinkcanvas:thinkcanvas@localhost:5432/thinkcanvas"
     )
+
+    # LLM (OpenAI-compatible — works with MiniMax / DeepSeek / 等)
+    openai_base_url: str = "https://api.minimaxi.com/v1"
+    openai_api_key: SecretStr = SecretStr("")  # 必填：填进根 .env
+    openai_model: str = "MiniMax-M3"
+    llm_timeout: int = 30
+    llm_max_tokens: int = 4000
+    llm_temperature: float = 0.2
+    llm_max_retries: int = 2  # retry this many times after the first attempt
+
+    # Manim rendering
+    manim_timeout: int = 60
+    manim_max_cpu: int = 1
+    manim_max_mem: int = 2048
+    manim_default_quality: str = "m"  # single letter: l|m|h|p|k
 
 
 @lru_cache
