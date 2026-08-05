@@ -17,11 +17,17 @@
 - 动画时长：单步 0.3-1.0s，总时长 < 30s
 - 排版：用 `to_edge(UP/DOWN/LEFT/RIGHT)` 留出边距
 
-# 输出格式
-- 纯 Python 代码，不用 markdown 代码块包裹
-- 第一个非空行必须是 `from manim import *`
-- 不要任何解释、注释（除了代码内的中文注释）
-- 末尾不加任何额外内容
+# 输出格式（必须严格按 JSON 回答）
+- 不用 markdown 代码块包裹
+- 唯一合法输出是单个 JSON 对象，结构如下：
+
+```json
+{"thought": "<一句话写出你的思路 / 出错反思>", "code": "<从 'from manim import *' 开始的完整 Python 代码，结尾不加任何额外内容>"}
+```
+
+- `thought` 字段必须填：1-2 句话说明当前思路，或对上一次错误的反思
+- `code` 字段必须填：可运行的 Manim 代码
+- JSON 之外不要加注释 / 解释 / markdown
 
 # 示例（冒泡排序）
 

@@ -20,10 +20,14 @@ class RenderResponse(BaseModel):
     error: str | None
 
 
-def _to_video_url(abs_video_path) -> str:
-    """Convert an absolute video path under ./media to a /media/<rel> URL."""
+def to_video_url(abs_video_path) -> str:
+    """Convert an absolute video path to a full backend URL.
+
+    Frontend runs at :3000, so the browser needs an absolute URL pointing at
+    the backend (:8000) where /media is mounted.
+    """
     rel = abs_video_path.relative_to(project_root / "media")
-    return f"/media/{rel.as_posix()}"
+    return f"http://localhost:8000/media/{rel.as_posix()}"
 
 
 @router.post("/render", response_model=RenderResponse)
@@ -35,7 +39,7 @@ async def render(req: RenderRequest) -> RenderResponse:
 
     return RenderResponse(
         code_path=str(result.code_path),
-        video_url=_to_video_url(result.video_path) if result.video_path else None,
+        video_url=to_video_url(result.video_path) if result.video_path else None,
         duration_sec=result.duration_sec,
         error=result.error,
     )

@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.minimaxi.com/v1"
     openai_api_key: SecretStr = SecretStr("")  # 必填：填进根 .env
     openai_model: str = "MiniMax-M3"
-    llm_timeout: int = 30
+    llm_timeout: int = 120  # seconds; cover long-thinking LLM responses
     llm_max_tokens: int = 4000
     llm_temperature: float = 0.2
     llm_max_retries: int = 2  # retry this many times after the first attempt
@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     manim_max_cpu: int = 1
     manim_max_mem: int = 2048
     manim_default_quality: str = "m"  # single letter: l|m|h|p|k
+
+    # CORS
+    cors_origins: str = "http://localhost:3000"
 
 
 @lru_cache

@@ -11,16 +11,87 @@
 
 1. **基建联通** —— Next.js + FastAPI + Postgres + Redis + RQ Worker 跑通
    - 完成标志：空页面能开，Worker 能消费队列
+   - **状态**：✅ 完成。Next 15 + FastAPI + Postgres + 后端最小 hello + 接 Postgres 接前端链路全跑通；Redis 起了但还没接业务。
 2. **Code 流水线** —— MiniMax-M3 接入 + AST 校验 + 错误重试 + 3 算法手写高质量 few-shot
    - 完成标志：CLI 能输出可执行代码
+   - **状态**：✅ 部分完成。LLM client 接通；`POST /generate` 单轮 + 简单重试；`/generate/agent` 跑 LangGraph 标准 ReAct（langgraph.prebuilt.create_react_agent）。3 算法 few-shot：**只写了冒泡排序 1 个**。
 3. **渲染流水线** —— subprocess + 资源限制 / 沙箱 + 产物落盘
    - 完成标志：CLI 能输出 mp4
+   - **状态**：✅ 完成。subprocess + 60s timeout；产物落 `./media/`；`/media` 静态文件挂载。LaTeX 没装时 MathTex 报错。
 4. **Web UI 最小版** —— 输入 / 进度（百分比 + 节点）/ 视频 / 代码 / 重渲染
    - 完成标志：Web 端到端跑通
+   - **状态**：✅ 基本版。输入 / Generate 按钮 / 进度条 / 视频 / 代码框 / 重渲染 / SSE 实时进度。全跑通。
 5. **持久化 + 多语言 + 可观测** —— user / history 表 + 中英切换 + LangSmith 接入
    - 完成标志：刷新页面历史还在；UI 切语言立刻反应
+   - **状态**：❌ 没动。
 6. **端到端验证** —— 3 个算法各跑 10 次，记录成功率 / 时长 / 修整
    - 完成标志：数据说话、可继续推进 v1.x
+   - **状态**：❌ 没动。
+
+---
+
+## 🤖 Agent / LangChain 学到的（截至本对话）
+
+| 模式 | 实现位置 | 状态 |
+|---|---|---|
+| **结构化输出**（强制 JSON `{thought, code}`） | `app/agents/coder.py::_parse_react_response` | ✅ 有 test 覆盖 |
+| **ReAct 反思 + 错误回喂**（手写版） | `app/agents/coder.py::CoderAgent` | ✅ 4 test 通过 |
+| **LangGraph 标准 ReAct** | `app/agents/react_coder.py` 用 `langgraph.prebuilt.create_react_agent` | ⚠️ 代码就位，**未实测** MiniMax 是否真返回 `tool_calls` |
+| **@tool 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ✅ 学习样本 |
+| **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `agent.run()`；agent 在 `app/agents/` | ✅ |
+
+### ⚠️ 已知问题（下一个模型应注意）
+
+1. **MiniMax 的 OpenAI 兼容 API 对 `tool_calls` 支持不明**。直接 `bind_tools()` 测过一次 LLM 没返回 tool_calls（陷入"全文字"模式）。LangGraph 版本目前还没实战验证。
+2. **few-shot 只有 1 个**（冒泡排序）；v1.0 范围要求的另外 2 个（二分查找、图 BFS 遍历）没写。
+3. **Redis 接了 docker 但没接业务**（任务队列层是空的——所有逻辑当前 in-process 完成）。
+4. **CORS / 项目根 .env / `SecretStr` / StructuredOutput 修复点**散落在这次 session 里，没整理到一个 PR-ready commit。
+5. **真正的 LangChain 链路没建对**：用户原始诉求是"学习 LangChain 项目"，当前实现多数是手写 loop。**下一个接手的人应该把 `app/agents/coder.py::CoderAgent` 重写成 LangGraph 标准 `StateGraph` 节点**（function-based or class-based），让 agent loop 真正由 LangGraph 状态机驱动。
+
+---
+
+## 🗂 关键文件清单（接手请扫这些）
+
+```
+backend/
+├── app/
+│   ├── agents/
+│   │   ├── coder.py           # 手写 CoderAgent（仓库主 agent）
+│   │   ├── react_coder.py    # LangGraph create_react_agent 版本（基本框架，没实战）
+│   │   └── tools.py           # @tool 装饰的 validate_manim_code / render_manim_dryrun
+│   ├── api/v1/
+│   │   ├── generate.py       # /generate (sync), /generate/stream (SSE), /generate/agent
+│   │   ├── render.py         # /render (单进程渲染)
+│   │   ├── health.py
+│   │   └── readyz.py
+│   ├── renderers/manim.py    # subprocess + 60s 超时
+│   ├── tools/validator.py    # AST + 危险模式 + Scene 子类检查
+│   ├── llm/client.py         # ChatOpenAI 配 MiniMax base_url
+│   ├── config.py             # 读项目根 .env，model_name = "MiniMax-M3"
+│   └── main.py
+├── tests/agents/
+│   └── test_coder.py         # 4 个测试全过（手写版 agent）
+├── pyproject.toml
+└── .env.example
+
+shared/prompts/system/v1.txt    # JSON 强约束输出 format
+
+frontend/
+├── app/page.tsx               # EventSource 订阅 + 进度条
+├── lib/api.ts                 # generateCode / renderManim / subscribeGenerate
+└── ...
+
+docker/docker-compose.yml      # postgres + redis 已起
+```
+
+---
+
+## 🔑 下一步建议（接手者）
+
+1. **最优先**：用 `langgraph.StateGraph` 重写 `app/agents/coder.py` 的 loop（不要手写）
+2. **其次**：补完 few-shot 库（二分查找、图 BFS 遍历）
+3. **再然后**：Step 5 持久化（user / history 表 + alembic 迁移）
+4. **最后**：Step 6 端到端 3 算法 × 10 次跑
 
 ---
 
