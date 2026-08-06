@@ -1,4 +1,5 @@
 """FastAPI application entry point."""
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -8,6 +9,10 @@ from app.api.v1.health import router as health_router
 from app.api.v1.readyz import router as readyz_router
 from app.api.v1.render import router as render_router
 from app.config import get_settings, project_root
+
+# Load .env explicitly so process-level os.environ is populated for any
+# third-party client that doesn't go through pydantic-settings (e.g. litellm).
+load_dotenv(project_root / ".env", override=False)
 
 
 def create_app() -> FastAPI:

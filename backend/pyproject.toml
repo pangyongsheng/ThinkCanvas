@@ -27,7 +27,8 @@ dependencies = [
     # AI / Agents
     "langgraph>=0.2",
     "langchain>=0.2",
-    "langchain-openai>=0.1",  # Used for DeepSeek (OpenAI-compatible API)
+    "langchain-litellm>=0.1",  # ChatLiteLLM — replaces langchain-openai; handles MiniMax tool/think format
+    "litellm>=1.40",           # underlying model-format shim (MiniMax tools / think blocks)
 
     # Logging
     "structlog>=24.1",

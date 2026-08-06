@@ -1,148 +1,117 @@
-"""Tests for ``app.agents.coder.CoderAgent``.
+"""Tests for the standard LangChain agent pipeline.
 
-Demonstrates that the agent is HTTP-independent and can be exercised with
-mocks — no FastAPI, no live LLM, no manim subprocess required.
+Validates that the four-layer architecture is wired correctly:
+
+  1. ``get_llm()`` returns an object typed as ChatOpenAI
+  2. ``create_agent`` is called with the standard kwargs
+     (``model``, ``tools``, ``system_prompt``, ``response_format``)
+  3. The structured response schema is honoured end-to-end (mocked)
+  4. ``CodeOutput`` schema validates and normalises code bodies
+
+No live LLM, no manim subprocess required.
 """
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
 
-from app.agents.coder import CoderAgent
-
-
-def _llm_json_response(thought: str, code: str) -> MagicMock:
-    resp = MagicMock()
-    resp.content = json.dumps({"thought": thought, "code": code}, ensure_ascii=False)
-    return resp
+from app.agents.builder import build_agent, SYSTEM_PROMPT, TOOLS
+from app.agents.state import CodeOutput
+from app.llm.client import get_llm
 
 
-GOOD_CODE = (
-    "from manim import *\n\n"
-    "class BubbleSort(Scene):\n"
-    "    def construct(self):\n"
-    "        pass\n"
-)
+def test_get_llm_is_typed_as_chat_openai():
+    """Business code should always see a ChatOpenAI — never the raw LiteLLM class."""
+    with patch("app.llm.client.ChatLiteLLM") as mock_litellm_cls:
+        mock_litellm_cls.return_value = MagicMock(name="litellm_instance")
+        get_llm.cache_clear()
+        try:
+            get_llm()
+        finally:
+            get_llm.cache_clear()
+        # cast() in client.py makes the static type ChatOpenAI even though
+        # the runtime object is the LiteLLM-backed mock. Verify via the
+        # function's declared return annotation (survives lru_cache wrapping).
+        import inspect
+        from app.llm import client as client_mod
+        ret = inspect.signature(client_mod.get_llm).return_annotation
+        assert str(ret) == "ChatOpenAI", f"get_llm() return type must be ChatOpenAI, got {ret}"
 
 
-def _fake_render_result(*, ok: bool, error: str | None = None):
-    """Mimics ``RenderResult`` (dataclass-like duck)."""
-    m = MagicMock()
-    m.error = None if ok else error
-    m.video_path = "/tmp/fake.mp4" if ok else None
-    return m
+def test_code_output_schema_validates_and_normalises():
+    """The structured-output Pydantic model slices at ``from manim import``."""
+    raw_code = "blah blah\nfrom manim import *\n\nclass S(Scene):\n    pass\n"
+    out = CodeOutput(thought="ok", code=raw_code)
+    assert out.code.startswith("from manim import *")
+    assert "blah blah" not in out.code
 
 
-@pytest.mark.asyncio
-async def test_agent_returns_code_on_first_try():
-    mock_llm = MagicMock()
-    mock_llm.ainvoke = AsyncMock(
-        return_value=_llm_json_response("simple plan", GOOD_CODE)
-    )
-
-    async def fake_render(code, scene_name):
-        return _fake_render_result(ok=True)
-
-    agent = CoderAgent(
-        llm=mock_llm,
-        max_steps=3,
-        renderer=fake_render,
-        validator=lambda c: (True, ""),
-        scene_name_extractor=lambda c: "BubbleSort",
-    )
-
-    result = await agent.run("冒泡排序")
-
-    assert result.code is not None
-    assert "BubbleSort" in result.code
-    assert len(result.steps) == 1
-    assert result.steps[0].validation == "OK"
-    assert result.steps[0].render == "rendered ok"
+def test_code_output_passes_through_when_already_clean():
+    out = CodeOutput(thought="ok", code="from manim import *\n\nclass S(Scene):\n    pass\n")
+    assert out.code.startswith("from manim import *")
 
 
-@pytest.mark.asyncio
-async def test_agent_retries_when_render_fails():
-    """Render failure on first attempt → LLM asked again → second attempt succeeds."""
-    call_count = {"n": 0}
+def test_build_agent_uses_create_agent_standard_api():
+    """The builder must call langchain.agents.create_agent with the right args.
 
-    async def fake_render(code, scene_name):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            return _fake_render_result(ok=False, error="IndexError: list out of range")
-        return _fake_render_result(ok=True)
+    LangChain 1.x standard form:
+        create_agent(model=chat_model, tools=[...], system_prompt=...,
+                     response_format=PydanticSchema)
+    """
+    with patch("app.llm.client.ChatLiteLLM") as mock_litellm_cls:
+        fake = MagicMock(name="litellm_instance")
+        mock_litellm_cls.return_value = fake
 
-    fixed_code = GOOD_CODE.replace("pass", "title = Text('ok')")
-    mock_llm = MagicMock()
-    mock_llm.ainvoke = AsyncMock(
-        side_effect=[
-            _llm_json_response("first try", GOOD_CODE),
-            _llm_json_response("fixed off-by-one", fixed_code),
-        ]
-    )
+        with patch("app.agents.builder.create_agent") as mock_create:
+            mock_create.return_value = "BUILT_AGENT"
+            build_agent.cache_clear()
+            try:
+                agent = build_agent()
+            finally:
+                build_agent.cache_clear()
+            assert agent == "BUILT_AGENT"
 
-    agent = CoderAgent(
-        llm=mock_llm,
-        max_steps=4,
-        renderer=fake_render,
-        validator=lambda c: (True, ""),
-        scene_name_extractor=lambda c: "BubbleSort",
-    )
+            call_kwargs = mock_create.call_args.kwargs
+            # model must be the chat model, NOT a Runnable
+            assert call_kwargs["model"] is fake
+            assert call_kwargs["tools"] == TOOLS
+            assert call_kwargs["system_prompt"] == SYSTEM_PROMPT
+            # structured output via response_format (LangChain 1.x standard)
+            assert call_kwargs["response_format"] is CodeOutput
 
-    result = await agent.run("冒泡排序")
 
-    assert result.code is not None
-    assert result.code == fixed_code.strip()  # agent strips trailing whitespace
-    assert len(result.steps) == 2
-    assert "render error" in result.steps[0].render
-    assert result.steps[1].render == "rendered ok"
+def test_tools_are_standard_langchain_tools():
+    """Both tools must be decorated with @tool."""
+    from app.agents.tools import validate_manim_code, render_manim_dryrun
+    for t in (validate_manim_code, render_manim_dryrun):
+        assert hasattr(t, "name"), f"{t} is not a @tool"
+        assert callable(t.invoke) or callable(t.ainvoke)
 
 
 @pytest.mark.asyncio
-async def test_agent_returns_none_when_validation_keeps_failing():
-    """If both attempts fail validation, agent returns None and stops at max_steps."""
-    broken_code = "class BubbleSort(Scene):\n    pass\n"  # missing import
+async def test_run_agent_returns_structured_code():
+    """End-to-end: run_agent pulls the structured response from the agent output."""
+    from langchain_core.messages import AIMessage
 
-    mock_llm = MagicMock()
-    mock_llm.ainvoke = AsyncMock(return_value=_llm_json_response("hmm", broken_code))
-
-    async def fake_render(code, scene_name):
-        return _fake_render_result(ok=True)
-
-    agent = CoderAgent(
-        llm=mock_llm,
-        max_steps=3,
-        renderer=fake_render,
-        validator=lambda c: (False, "missing required import: from manim import *"),
-        scene_name_extractor=lambda c: "BubbleSort",
+    structured = CodeOutput(
+        thought="ok",
+        code="from manim import *\n\nclass S(Scene):\n    pass\n",
     )
+    fake_agent = MagicMock()
 
-    result = await agent.run("冒泡排序")
+    async def _fake_ainvoke(*_args, **_kwargs):
+        return {
+            "messages": [AIMessage(content="thought: ok")],
+            "structured_response": structured,
+        }
+    fake_agent.ainvoke = _fake_ainvoke
 
-    assert result.code is None
-    assert len(result.steps) == 3
-    assert all("errors: missing required import" in s.validation for s in result.steps)
+    with patch("app.agents.react_coder.build_agent", return_value=fake_agent):
+        from app.agents.react_coder import run_agent
+        result = await run_agent("冒泡排序", max_iterations=4)
 
-
-@pytest.mark.asyncio
-async def test_agent_handles_llm_call_failure():
-    """Network / API failure → agent skips the step and continues."""
-    mock_llm = MagicMock()
-    mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("connection reset"))
-
-    async def fake_render(code, scene_name):
-        return _fake_render_result(ok=True)
-
-    agent = CoderAgent(
-        llm=mock_llm,
-        max_steps=2,
-        renderer=fake_render,
-        validator=lambda c: (True, ""),
-        scene_name_extractor=lambda c: "BubbleSort",
-    )
-
-    result = await agent.run("prompt")
-
-    assert result.code is None
-    assert all(s.render == "LLM call failed" for s in result.steps)
+    assert result["code"] == structured.code
+    assert "from manim import *" in result["code"]

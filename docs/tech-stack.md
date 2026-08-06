@@ -11,13 +11,14 @@
 ## 🧱 技术清单
 
 ### 🧠 Agent 核心
-| 技术点 | 项目里的落点 | 学习目标 |
-|---|---|---|
-| **LangGraph** | pipeline 状态机（planning / coding / validating / fixing / rendering） | 状态机、conditional edge、checkpointer、可视化 |
-| **ReAct** | 单 Agent 内部的"思考 + 调工具"循环 | Thought / Action / Observation 范式 |
-| **Tool Use / Function Calling** | 调 validator / renderer / history-searcher | function schema 设计、tool 调度 |
-| **Structured Output** | LLM 输出 plan dict / code / error | JSON Schema、Pydantic、Tool output mode |
-| **Self-Reflection** | agent 自检代码（缓解"算法表达不精确"风险） | 自我评估 loop、meta-prompt |
+| 技术点 | 项目里的落点 | 学习目标 | 状态 |
+|---|---|---|---|
+| **LangGraph** | 计划用 pipeline 状态机（planning / coding / validating / fixing / rendering） | 状态机、conditional edge、checkpointer、可视化 | ⏸️ 暂缓 — MiniMax 不支持 tool_calls，`react_coder.py` 是死代码 |
+| **手写 agent loop + LangChain 零件** | `app/agents/coder/`（coder.py / retry.py / parser.py / chain.py） | LCEL、parser、Pydantic、retry pattern | ✅ 实际在用 |
+| **Structured Output** | LLM 输出 `{thought, code}` → Pydantic 解析 | JSON Schema、Pydantic、OutputParser | ✅ |
+| **Tool Use / Function Calling** | — | function schema、tool 调度 | ⏸️ 等支持 tool_calls 的 LLM |
+| **ReAct** | — | Thought / Action / Observation | ⏸️ 同上 |
+| **Self-Reflection** | 错误重试时把 stderr 回喂 LLM | meta-prompt | ✅ |
 
 ### 🧩 记忆与检索
 | 技术点 | 项目里的落点 | 学习目标 |
@@ -50,23 +51,24 @@
 | **Token / 上下文窗口管理** | 限长 prompt、few-shot 截断 |
 
 ### 📦 基础设施（详见 [architecture.md](architecture.md)）
-| 技术点 | 用途 |
-|---|---|
-| LLM（**MiniMax-M3** / DeepSeek-V3 备胎） | 代码生成 |
-| ManimCE | 动画渲染 |
-| FastAPI + Pydantic | 后端框架 |
-| Next.js + TS | 前端 |
-| Redis + RQ | 任务队列 |
-| Postgres + SQLAlchemy + Alembic | 数据 |
-| WebSocket | 实时进度推送 |
+| 技术点 | 用途 | 当前状态 |
+|---|---|---|
+| LLM（**MiniMax-M3** / DeepSeek-V3 备胎） | 代码生成 | ✅ 默认 MiniMax-M3，OpenAI 兼容 API |
+| ManimCE | 动画渲染 | ✅ |
+| FastAPI + Pydantic | 后端框架 | ✅ |
+| Next.js + TS | 前端 | ✅ |
+| langchain-openai + LCEL | LLM 调用骨架 | ✅ |
+| Redis + RQ | 任务队列 | ⚠️ docker 起了，**未接业务** |
+| Postgres + SQLAlchemy + Alembic | 数据 | ⚠️ 库在，无业务表 |
+| SSE（EventSource） | 实时进度推送 | ✅（替代原计划 WebSocket） |
 
 ## 🗺 学习路径
 
 | 阶段 | 重点技术点 |
 |---|---|
-| **v1.0**（3 算法端到端跑通） | LangGraph · Tool Use · Structured Output · 持久化记忆 · 沙箱（subprocess）· Streaming · Observability |
+| **v1.0**（3 算法端到端跑通） | Structured Output · 沙箱（subprocess）· Streaming（SSE）· 持久化记忆 |
 | **v1.x**（扩算法 / 场景广度） | RAG / Embedding · Self-Reflection · Vision · Prompt Caching |
-| **v2.0**（协作 / 多模产物） | MCP · ReAct 深化（多工具调度） |
+| **v2.0**（协作 / 多模产物） | MCP · ReAct 深化（多工具调度） · LangGraph 状态机 |
 
 ## ❌ 本文档不做的事
 

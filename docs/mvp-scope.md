@@ -34,19 +34,19 @@
 
 | 模式 | 实现位置 | 状态 |
 |---|---|---|
-| **结构化输出**（强制 JSON `{thought, code}`） | `app/agents/coder.py::_parse_react_response` | ✅ 有 test 覆盖 |
-| **ReAct 反思 + 错误回喂**（手写版） | `app/agents/coder.py::CoderAgent` | ✅ 4 test 通过 |
-| **LangGraph 标准 ReAct** | `app/agents/react_coder.py` 用 `langgraph.prebuilt.create_react_agent` | ⚠️ 代码就位，**未实测** MiniMax 是否真返回 `tool_calls` |
-| **@tool 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ✅ 学习样本 |
-| **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `agent.run()`；agent 在 `app/agents/` | ✅ |
+| **结构化输出**（强制 JSON `{thought, code}`） | `app/agents/coder/parser.py::CodeOutput` | ✅ 有 test 覆盖 |
+| **手写 ReAct 反思 + 错误回喂** | `app/agents/coder/coder.py::CoderAgent` + `retry.py::validate_only_retry` | ✅ 4 test 通过 |
+| **LangGraph 标准 ReAct** | `app/agents/react_coder.py` 用 `langgraph.prebuilt.create_react_agent` | ❌ **死代码**：MiniMax 不支持 tool_calls，验证过不可用 |
+| **@tool 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ⚠️ 死代码：同上 |
+| **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `agent.run_streaming()`；agent 在 `app/agents/coder/` | ✅ |
 
 ### ⚠️ 已知问题（下一个模型应注意）
 
-1. **MiniMax 的 OpenAI 兼容 API 对 `tool_calls` 支持不明**。直接 `bind_tools()` 测过一次 LLM 没返回 tool_calls（陷入"全文字"模式）。LangGraph 版本目前还没实战验证。
+1. **MiniMax 不支持 `tool_calls`** ✅ 已确认（不是"不明"）。结论：维持手写 agent loop + LangChain 零件（parser / LCEL），不切 LangGraph ReAct。详见 [docs/session-summary.md](session-summary.md)。
 2. **few-shot 只有 1 个**（冒泡排序）；v1.0 范围要求的另外 2 个（二分查找、图 BFS 遍历）没写。
-3. **Redis 接了 docker 但没接业务**（任务队列层是空的——所有逻辑当前 in-process 完成）。
-4. **CORS / 项目根 .env / `SecretStr` / StructuredOutput 修复点**散落在这次 session 里，没整理到一个 PR-ready commit。
-5. **真正的 LangChain 链路没建对**：用户原始诉求是"学习 LangChain 项目"，当前实现多数是手写 loop。**下一个接手的人应该把 `app/agents/coder.py::CoderAgent` 重写成 LangGraph 标准 `StateGraph` 节点**（function-based or class-based），让 agent loop 真正由 LangGraph 状态机驱动。
+3. **Redis 接了 docker 但没接业务**（任务队列层是空的——所有渲染当前 in-process 完成）。
+4. **渲染失败自动修复未接**：v1.0 只做了校验错误回喂重试；渲染失败的 stderr 没回喂 LLM。
+5. **死代码待清理**：`react_coder.py` / `tools.py` / `POST /generate` / `POST /generate/agent` 没删。
 
 ---
 
@@ -56,42 +56,51 @@
 backend/
 ├── app/
 │   ├── agents/
-│   │   ├── coder.py           # 手写 CoderAgent（仓库主 agent）
-│   │   ├── react_coder.py    # LangGraph create_react_agent 版本（基本框架，没实战）
-│   │   └── tools.py           # @tool 装饰的 validate_manim_code / render_manim_dryrun
+│   │   ├── coder/                       # ✅ 实际在用
+│   │   │   ├── coder.py                 # CoderAgent 类
+│   │   │   ├── retry.py                 # validate_only_retry + call_llm_once
+│   │   │   ├── chain.py                 # RunnableSequence 构造
+│   │   │   ├── parser.py                # CodeOutput + parse_with_fallback
+│   │   │   ├── sync.py                  # run_sync
+│   │   │   └── stream.py                # run_streaming（SSE）
+│   │   ├── react_coder.py               # ⚠️ 死代码：LangGraph ReAct（MiniMax 不支持 tool_calls）
+│   │   └── tools.py                     # ⚠️ 死代码：@tool 装饰
 │   ├── api/v1/
-│   │   ├── generate.py       # /generate (sync), /generate/stream (SSE), /generate/agent
-│   │   ├── render.py         # /render (单进程渲染)
+│   │   ├── generate.py                  # /generate (legacy), /generate/stream (生产), /generate/agent (死)
+│   │   ├── render.py                    # /render
 │   │   ├── health.py
 │   │   └── readyz.py
-│   ├── renderers/manim.py    # subprocess + 60s 超时
-│   ├── tools/validator.py    # AST + 危险模式 + Scene 子类检查
-│   ├── llm/client.py         # ChatOpenAI 配 MiniMax base_url
-│   ├── config.py             # 读项目根 .env，model_name = "MiniMax-M3"
+│   ├── renderers/manim.py               # subprocess + 60s 超时
+│   ├── tools/validator.py               # AST + 危险模式 + Scene 子类检查
+│   ├── llm/client.py                    # ChatOpenAI 配 MiniMax base_url
+│   ├── config.py                        # 读项目根 .env，model_name = "MiniMax-M3"
 │   └── main.py
 ├── tests/agents/
-│   └── test_coder.py         # 4 个测试全过（手写版 agent）
+│   └── test_coder.py                    # 4/4 测试通过
 ├── pyproject.toml
 └── .env.example
 
-shared/prompts/system/v1.txt    # JSON 强约束输出 format
+shared/prompts/system/v1.txt             # System prompt（嵌 1 个冒泡排序 few-shot）
+shared/prompts/examples/                 # ⚠️ 空目录；后续 few-shot 库位置
 
 frontend/
-├── app/page.tsx               # EventSource 订阅 + 进度条
-├── lib/api.ts                 # generateCode / renderManim / subscribeGenerate
+├── app/page.tsx                         # EventSource 订阅 + 进度条 + 视频 + 代码框
+├── lib/api.ts                           # generateCode / renderManim / subscribeGenerate
 └── ...
 
-docker/docker-compose.yml      # postgres + redis 已起
+docker/docker-compose.yml                # postgres + redis 已起（redis 未接业务）
 ```
 
 ---
 
 ## 🔑 下一步建议（接手者）
 
-1. **最优先**：用 `langgraph.StateGraph` 重写 `app/agents/coder.py` 的 loop（不要手写）
-2. **其次**：补完 few-shot 库（二分查找、图 BFS 遍历）
-3. **再然后**：Step 5 持久化（user / history 表 + alembic 迁移）
-4. **最后**：Step 6 端到端 3 算法 × 10 次跑
+1. **最高优先**：Worker 异步化（`backend/app/workers/` 写渲染任务 + `rq.enqueue` 改造 API）
+2. **其次**：补完 few-shot 库（二分查找、图 BFS 遍历，存 `shared/prompts/examples/`）
+3. **再然后**：清理死代码（`react_coder.py` / `tools.py` / `POST /generate` / `POST /generate/agent`）
+4. **Step 5**：持久化（user / history 表 + alembic 迁移 + 中英切换）
+5. **Step 6**：端到端 3 算法 × 10 次跑（数据说话）
+6. **远期**：等换支持 tool_calls 的 LLM 后，把 `app/agents/coder/coder.py` 的 loop 重写成 `langgraph.StateGraph`
 
 ---
 

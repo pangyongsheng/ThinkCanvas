@@ -51,10 +51,9 @@
 
 ## 🔭 长期愿景
 
-1. **v0.1** — 跑通 Web + 算法可视化（当前）
-2. **v0.5** — 加上数学公式、3D 图形
-3. **v1.0** — 通用概念图、流程图、架构图
-4. **v2.0** — 协作编辑 + 模板市场 + 社区
+1. **v1.0** — 跑通 Web + 算法可视化（当前）
+2. **v1.x** — 扩展算法谱与场景广度（数学 / 物理 / 流程图等）
+3. **v2.0** — 协作编辑 + 模板市场 + 社区
 
 ## 📦 需求基线（v0.1 对齐稿）
 
@@ -174,8 +173,11 @@ v1.0 跑通后的下一阶段重头戏是 **扩展算法谱与场景**：
 
 ## ❓ 还没回答的问题（待讨论）
 
+### 已收敛
+- ✅ LLM 默认切到 **MiniMax-M3**：已通过 OpenAI 兼容 API 接入（[backend/app/llm/client.py](../..//backend/app/llm/client.py) + [backend/app/config.py](../../backend/app/config.py)）
+- ✅ MiniMax 不支持 `tool_calls`：被迫手写 agent loop + LangChain 零件，详见 [docs/session-summary.md](session-summary.md)
+
 ### 本次讨论新增
-- [ ] LLM 默认切换到 MiniMax-M3：如何接入（base_url / SDK / 鉴权）？
 - [ ] 伪代码 / 截图 的处理路径：LLM 直接读，还是先结构化解析再喂？
 - [ ] 风格枚举（`3b1b / minimal / academic`）的具体视觉参考什么时候固化？
 - [ ] 代码编辑器形态：内嵌 Monaco / CodeMirror，还是外跳 GitHub Gist？

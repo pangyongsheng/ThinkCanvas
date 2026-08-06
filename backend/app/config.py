@@ -25,10 +25,14 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://thinkcanvas:thinkcanvas@localhost:5432/thinkcanvas"
     )
 
-    # LLM (OpenAI-compatible — works with MiniMax / DeepSeek / 等)
-    openai_base_url: str = "https://api.minimaxi.com/v1"
-    openai_api_key: SecretStr = SecretStr("")  # 必填：填进根 .env
-    openai_model: str = "MiniMax-M3"
+    # LLM — all model-format quirks (MiniMax thinking blocks, tool-call
+    # tags, etc.) are handled by embedded LiteLLM (via langchain-litellm);
+    # this layer only holds endpoint / credentials / generation params.
+    # See app.llm.client.
+    llm_provider: str = "openai"  # litellm provider prefix, e.g. "openai" / "deepseek"
+    llm_api_base: str = "https://api.minimaxi.com/v1"
+    llm_api_key: SecretStr = SecretStr("")  # 必填：填进根 .env
+    llm_model_raw: str = "MiniMax-M3"  # raw upstream model name (no provider prefix)
     llm_timeout: int = 120  # seconds; cover long-thinking LLM responses
     llm_max_tokens: int = 4000
     llm_temperature: float = 0.2
