@@ -62,24 +62,4 @@
 | Postgres + SQLAlchemy + Alembic | 数据 | ⚠️ 库在，无业务表 |
 | SSE（EventSource） | 实时进度推送 | ✅（替代原计划 WebSocket） |
 
-## 🗺 学习路径
 
-| 阶段 | 重点技术点 |
-|---|---|
-| **v1.0**（3 算法端到端跑通） | Structured Output · 沙箱（subprocess）· Streaming（SSE）· 持久化记忆 |
-| **v1.x**（扩算法 / 场景广度） | RAG / Embedding · Self-Reflection · Vision · Prompt Caching |
-| **v2.0**（协作 / 多模产物） | MCP · ReAct 深化（多工具调度） · LangGraph 状态机 |
-
-## ❌ 本文档不做的事
-
-- ❌ 不写具体 schema
-- ❌ 不定库版本号
-- ❌ 不画模块依赖图
-- ❌ 不对比 LLM / 向量库的 provider 优劣
-
-## 🔗 与其他文档的关系
-
-- 策略 / 范围 → [product.md](product.md)
-- 系统架构 → [architecture.md](architecture.md)
-- 工作流与 Agent 设计 → [workflow-design.md](workflow-design.md)
-- LLM Prompt → [llm-prompt.md](llm-prompt.md)
