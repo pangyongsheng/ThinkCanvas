@@ -66,6 +66,7 @@ v1.0 6 步基线 + v1.1.1-1.1.3（多轮对话 / 用户系统 / 规范化）已�
 ## 已知坑
 
 - **MiniMax 偶发只输出 `[thinking]` 块** → `agent_recovery.py` 四层兜底
+- **MiniMax `result.content` 是 typed-block list**（`[{"type":"thinking",...}, {"type":"text","text":"..."}]`），不是 str。任何直接对 `result.content.strip()` / `.split()` 的调用都会崩。处理方法见 `app/agents/summarizer.py::_extract_text_from_message`——单次 LLM 调用（非 agent loop）也要走这个 helper。
 - **M3 thinking 占满预算** → 1-shot retry
 - **No module 'aiosqlite'** → 测试用同步 in-memory SQLite，不上 async session fixture
 - **Sandbox 不能 git 写** → 代码改动直接 `mv` / `sed -i`，不依赖 `git mv`

@@ -7,14 +7,24 @@ should:
   * describe what the animation *shows* (so semantic search works)
   * be one short Chinese sentence (so it fits a prompt slot later)
 
-Deliberately NOT wrapped in `create_agent` — there's no tool loop, no
+Deliberately NOT wrapped in ``create_agent`` — there's no tool loop, no
 structured output, just a single chat completion.
+
+MiniMax-M3 quirk: ``result.content`` comes back as a list of typed
+blocks ``[{"type": "thinking", ...}, {"type": "text", ...}]`` instead
+of a plain string. We extract the first ``text`` block — see
+``_extract_text_from_message``.
+
+Embedding is computed separately, in the background, by the API
+handler (see ``app.api.v1.few_shots._backfill_embedding``) so the
+POST round-trip doesn't have to wait for the embedding model.
 """
 from __future__ import annotations
 
 import logging
+from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.llm.client import get_llm
 
@@ -30,6 +40,27 @@ _SYSTEM = (
     "- 简明描述动画内容（不要列举代码细节）\n"
     "- 只输出一句话，不要任何解释或前缀"
 )
+
+
+def _extract_text_from_message(content: Any) -> str:
+    """Pull the first ``text`` block out of an AIMessage's content.
+
+    MiniMax returns ``content`` as either:
+      * ``str``  — normal providers
+      * ``list`` — typed blocks ``[{"type": "thinking", ...},
+        {"type": "text", "text": "..."}]``
+      * ``None`` — model produced no usable output
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") in {"text", "output_text"}:
+                    return block.get("text") or ""
+            elif isinstance(block, str):
+                return block
+    return ""
 
 
 async def summarise_few_shot(prompt: str, code: str) -> str:
@@ -49,7 +80,7 @@ async def summarise_few_shot(prompt: str, code: str) -> str:
         result = await llm.ainvoke(
             [SystemMessage(content=_SYSTEM), HumanMessage(content=user_msg)]
         )
-        text = (result.content or "").strip()
+        text = _extract_text_from_message(getattr(result, "content", None))
         # Strip any leading "summary:" / quotes / markdown the model adds.
         text = text.strip("\"'`*").strip()
         if "\n" in text:
@@ -60,6 +91,7 @@ async def summarise_few_shot(prompt: str, code: str) -> str:
                 len(prompt), len(text),
             )
             return text[:200]
+        logger.warning("summarise_few_shot.empty_content prompt_len=%d", len(prompt))
     except Exception:
         logger.exception("summarise_few_shot.failed")
 
@@ -67,4 +99,4 @@ async def summarise_few_shot(prompt: str, code: str) -> str:
     return prompt.strip()[:200]
 
 
-__all__ = ["summarise_few_shot"]
+__all__ = ["summarise_few_shot", "_extract_text_from_message"]

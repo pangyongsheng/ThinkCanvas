@@ -39,6 +39,12 @@ class FewShot(Base):
     # Required now — the POST endpoint generates it before insert.
     summary: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Embedding of ``summary`` (bge-small-zh, 512 dims).
+    # Stored as JSON text — we don't need pgvector for the current data
+    # scale (low hundreds of rows max), and JSON keeps us off the
+    # pgvector / Docker image rabbit hole.
+    summary_embedding: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Provenance: which conversation + which assistant message did this come from.
     # Nullable so we can ingest curated samples from outside the app later
     # (e.g. seed scripts) without faking conversation IDs.
