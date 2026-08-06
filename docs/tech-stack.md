@@ -14,7 +14,7 @@
 | 技术点 | 项目里的落点 | 学习目标 | 状态 |
 |---|---|---|---|
 | **LangGraph** | 计划用 pipeline 状态机（planning / coding / validating / fixing / rendering） | 状态机、conditional edge、checkpointer、可视化 | ⏸️ 暂缓 — MiniMax 不支持 tool_calls，`react_coder.py` 是死代码 |
-| **手写 agent loop + LangChain 零件** | `app/agents/coder/`（coder.py / retry.py / parser.py / chain.py） | LCEL、parser、Pydantic、retry pattern | ✅ 实际在用 |
+| **标准 `create_agent` + LiteLLM 适配层**（2026-08 升级）| `app/agents/builder.py` + `app/llm/client.py` | `langchain.agents.create_agent` + `response_format=CodeOutput` + `langchain-litellm` | ✅ 实际在用 |
 | **Structured Output** | LLM 输出 `{thought, code}` → Pydantic 解析 | JSON Schema、Pydantic、OutputParser | ✅ |
 | **Tool Use / Function Calling** | — | function schema、tool 调度 | ⏸️ 等支持 tool_calls 的 LLM |
 | **ReAct** | — | Thought / Action / Observation | ⏸️ 同上 |

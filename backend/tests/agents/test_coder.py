@@ -18,7 +18,10 @@ import pytest
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
-from app.agents.builder import build_agent, SYSTEM_PROMPT, TOOLS
+from app.agents.builder import build_agent, TOOLS
+from app.agents.styles import DEFAULT_STYLE_ID, load_style
+
+SYSTEM_PROMPT = load_style(DEFAULT_STYLE_ID).description
 from app.agents.state import CodeOutput
 from app.llm.client import get_llm
 

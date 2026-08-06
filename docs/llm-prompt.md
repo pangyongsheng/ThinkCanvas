@@ -131,7 +131,7 @@ class BubbleSort(Scene):
 
 ### 校验失败重试
 
-实现位置：[`backend/app/agents/coder/retry.py`](../../backend/app/agents/coder/retry.py) :: `validate_only_retry`
+实现位置：[`backend/app/agents/react_coder.py`](../../backend/app/agents/react_coder.py) — `create_agent` 内置工具循环
 
 ```python
 async def validate_only_retry(prompt, llm_call, max_retries=2):

@@ -14,7 +14,7 @@
    - **状态**：✅ 完成。Next 15 + FastAPI + Postgres + 后端最小 hello + 接 Postgres 接前端链路全跑通；Redis 起了但还没接业务。
 2. **Code 流水线** —— MiniMax-M3 接入 + AST 校验 + 错误重试 + 3 算法手写高质量 few-shot
    - 完成标志：CLI 能输出可执行代码
-   - **状态**：✅ 部分完成。LLM client 接通；`POST /generate` 单轮 + 简单重试；`/generate/agent` 跑 LangGraph 标准 ReAct（langgraph.prebuilt.create_react_agent）。3 算法 few-shot：**只写了冒泡排序 1 个**。
+   - **状态**：✅ **已完成（2026-08 升级）**。LiteLLM 适配层接通 MiniMax；标准 LangChain 1.x `create_agent(model=, tools=, system_prompt=, response_format=CodeOutput)` 取代手写 agent loop（手写 LCEL chain / JSON parser / 工具循环全部删除）；3 算法 few-shot：**只写了冒泡排序 1 个**（仍欠 2 个）。
 3. **渲染流水线** —— subprocess + 资源限制 / 沙箱 + 产物落盘
    - 完成标志：CLI 能输出 mp4
    - **状态**：✅ 完成。subprocess + 60s timeout；产物落 `./media/`；`/media` 静态文件挂载。LaTeX 没装时 MathTex 报错。
@@ -30,23 +30,24 @@
 
 ---
 
-## 🤖 Agent / LangChain 学到的（截至本对话）
+## 🤖 Agent / LangChain 学到的（截至 2026-08 重构）
 
 | 模式 | 实现位置 | 状态 |
 |---|---|---|
-| **结构化输出**（强制 JSON `{thought, code}`） | `app/agents/coder/parser.py::CodeOutput` | ✅ 有 test 覆盖 |
-| **手写 ReAct 反思 + 错误回喂** | `app/agents/coder/coder.py::CoderAgent` + `retry.py::validate_only_retry` | ✅ 4 test 通过 |
-| **LangGraph 标准 ReAct** | `app/agents/react_coder.py` 用 `langgraph.prebuilt.create_react_agent` | ❌ **死代码**：MiniMax 不支持 tool_calls，验证过不可用 |
-| **@tool 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ⚠️ 死代码：同上 |
-| **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `agent.run_streaming()`；agent 在 `app/agents/coder/` | ✅ |
+| **LiteLLM 适配层** | `app/llm/client.py::ChatLiteLLM` 封装为 `ChatOpenAI` | ✅ 业务只见 `ChatOpenAI` |
+| **结构化输出**（`CodeOutput` Pydantic schema） | `app/agents/state.py::CodeOutput` + `create_agent(response_format=...)` | ✅ 6 test 通过 |
+| **标准 LangChain 1.x `create_agent`** | `app/agents/builder.py` 调用 `langchain.agents.create_agent` | ✅ 单例，lru_cache |
+| **`@tool` 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ✅ agent 直接调用 |
+| **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `run_agent()`；agent 在 `app/agents/builder.py` | ✅ |
+| **可观测性** | `app/core/logging.py` + `run_agent` 进出日志 + FastAPI 全局异常中间件 | ✅ |
 
 ### ⚠️ 已知问题（下一个模型应注意）
 
-1. **MiniMax 不支持 `tool_calls`** ✅ 已确认（不是"不明"）。结论：维持手写 agent loop + LangChain 零件（parser / LCEL），不切 LangGraph ReAct。详见 [docs/session-summary.md](session-summary.md)。
-2. **few-shot 只有 1 个**（冒泡排序）；v1.0 范围要求的另外 2 个（二分查找、图 BFS 遍历）没写。
-3. **Redis 接了 docker 但没接业务**（任务队列层是空的——所有渲染当前 in-process 完成）。
-4. **渲染失败自动修复未接**：v1.0 只做了校验错误回喂重试；渲染失败的 stderr 没回喂 LLM。
-5. **死代码待清理**：`react_coder.py` / `tools.py` / `POST /generate` / `POST /generate/agent` 没删。
+1. ~~MiniMax 不支持 `tool_calls`~~ → **已解决**：用 LiteLLM 内嵌归一化，业务层标准 LangChain 写法。详见 [docs/session-summary.md](session-summary.md#session-2-litellm-适配层--标准-langchain-1x-重构2026-08-06)。
+2. **LiteLLM 链路偶发 Connection error**：MiniMax 自身稳定性问题；需要补 tenacity 重试层（v1.x TODO）。
+3. **few-shot 只有 1 个**（冒泡排序）；v1.0 范围要求的另外 2 个（二分查找、图 BFS 遍历）没写。
+4. **Redis 接了 docker 但没接业务**（任务队列层是空的——所有渲染当前 in-process 完成）。
+5. **手写 loop 已清理**：`coder/` 子目录 6 个文件全部删除；`create_react_agent` 不再使用。
 
 ---
 
@@ -100,7 +101,7 @@ docker/docker-compose.yml                # postgres + redis 已起（redis 未�
 3. **再然后**：清理死代码（`react_coder.py` / `tools.py` / `POST /generate` / `POST /generate/agent`）
 4. **Step 5**：持久化（user / history 表 + alembic 迁移 + 中英切换）
 5. **Step 6**：端到端 3 算法 × 10 次跑（数据说话）
-6. **远期**：等换支持 tool_calls 的 LLM 后，把 `app/agents/coder/coder.py` 的 loop 重写成 `langgraph.StateGraph`
+6. **远期**：等加多 Agent 编排时（v2.0），评估是否升级到 `langgraph.StateGraph`；当前 `create_agent` 单 agent 已够
 
 ---
 

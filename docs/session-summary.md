@@ -127,3 +127,87 @@ LangChain 的 `|` 类型签名静态分析推断不通。
 - `docs/product.md`：产品定位
 - `docs/tech-stack.md`：技术栈选型
 - `shared/prompts/system/v1.txt`：当前 prompt（只有冒泡排序 1 个 few-shot）
+---
+
+## Session #2: LiteLLM 适配层 + 标准 LangChain 1.x 重构（2026-08-06）
+
+### 背景
+Session #1 留的现状是手写 agent loop + LangChain 零件。问题：
+1. MiniMax 不支持 OpenAI 标准 `tool_calls`，被迫手写解析循环
+2. JSON 输出走 `PydanticOutputParser` + 手写 fallback regex
+3. `<think>` 块要手写正则剥
+4. Agent 文件 6 个，加 react_coder.py 一共 7 个，~530 行手写样板
+
+### 目标
+业务代码全部用 LangChain 1.x 标准写法（`create_agent` / `with_structured_output` / `ChatOpenAI`），靠 LiteLLM 抹平 MiniMax 协议差异。
+
+### 关键决策
+**A. 模型层用 `langchain_litellm.ChatLiteLLM`，对外暴露为 `ChatOpenAI` 类型**
+
+理由：
+- 业务代码 100% 标准 LangChain 写法（`from langchain_openai import ChatOpenAI`）
+- LiteLLM 内嵌调用（不启 proxy 服务），守住开局约束
+- 运行时是 `ChatLiteLLM` 实例，静态类型注解是 `ChatOpenAI`，用 `cast()` 桥接
+- 切换厂商（DeepSeek / OpenAI 原生）只改 `client.py` 一个文件
+
+**B. 结构化输出用 `create_agent(..., response_format=CodeOutput)`**
+
+不是 `llm.with_structured_output(CodeOutput)` —— 因为后者返回 `RunnableSequence`，不是 `BaseChatModel`，`create_agent.model=` 参数不接受。LangChain 1.x 标准做法是 `model` + `response_format` 分开传。
+
+**C. 删除所有手写循环、解析、chain 装配**
+
+- `coder/parser.py` —— 删除（被 Pydantic 自动校验取代）
+- `coder/chain.py` —— 删除（LCEL 装配被 `create_agent` 内置取代）
+- `coder/coder.py` —— 删除 `CoderAgent` 手写循环
+- `coder/retry.py` —— 删除 `validate_only_retry`（agent 内置工具循环）
+- `coder/sync.py` —— 删除（重写 `run_agent` 一处）
+- `coder/stream.py` —— 删除（SSE 在 HTTP 层重写）
+
+### 最终结构
+
+```
+backend/app/
+├── llm/
+│   └── client.py          # 唯一出现 ChatLiteLLM；cast(ChatOpenAI, litellm_chat)
+├── agents/
+│   ├── state.py           # Pydantic CodeOutput（response_format schema）
+│   ├── tools.py           # @tool 装饰的工具函数
+│   ├── builder.py         # create_agent(model=, tools=, system_prompt=, response_format=)
+│   └── react_coder.py     # run_agent 入口 + 日志
+├── core/
+│   └── logging.py         # structlog + 全局异常中间件（可观测性）
+├── api/v1/generate.py     # 3 个端点（/generate、/generate/agent、/generate/stream）
+└── main.py                # load_dotenv + configure_logging + FastAPI 工厂
+```
+
+### 验证结果
+
+| 检查 | 结果 |
+|---|---|
+| `pytest tests/agents/test_coder.py` | **6/6 通过** |
+| 静态扫描：业务层 0 个 `ChatLiteLLM` 引用 | ✅ |
+| 静态扫描：可执行代码 0 个 `ChatOpenAI` / `MiniMaxChat` / `langchain_community` / `strip_think_blocks` | ✅ |
+| `get_llm()` 静态类型注解 = `ChatOpenAI` | ✅ |
+| `get_llm()` 运行时类型 = `ChatLiteLLM` | ✅ |
+| `create_agent(...)` 产出 `CompiledStateGraph` | ✅ |
+| 前端实测（"画一个旋转的正方形"）出 mp4 | ✅ |
+
+### 踩坑记录
+
+1. **`langchain-litellm` 装包卡死**（0.7.0 之前版本）→ 用 `--no-deps` + 手动补依赖绕开
+2. **`timeout` / `max_tokens` kwargs 在 `ChatLiteLLM.__init__` 看不到**（`*args, **kwargs` 签名）→ 归到 `model_kwargs` 字典透传
+3. **`create_agent(model=...)` 不接受 Runnable** → 只传 chat model，结构化走 `response_format`
+4. **`ainvoke(config=...)` 类型签名要 `RunnableConfig`** → 用 `cast(RunnableConfig, ...)` 标注
+
+### 当前状态（v1.0 已跑通）
+
+- ✅ 端到端：前端输入 → 后端 `create_agent` → MiniMax 生成代码 → 工具验证 + 渲染 → SSE 推 mp4
+- ⚠️ 偶发失败：LiteLLM + MiniMax 自身稳定性问题（Connection error / 模型未收敛），需要补 tenacity 重试
+
+### 下一步建议
+
+1. **LiteLLM 重试层**：`tenacity` 包 `acompletion`，网络错自动重试 2 次
+2. **补 few-shot**：v1.0 要 3 个算法（冒泡排序已有），补 二分查找 + 图 BFS
+3. **Step 5 持久化**：user/history 表 + 历史查询 API + 前端列表
+4. **Step 6 压测**：3 算法 × 10 次，统计成功率 + P95 延迟
+

@@ -11,15 +11,22 @@ Endpoints
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException
+from fastapi import Query
 from pydantic import BaseModel
 
 from app.agents.react_coder import run_agent
+from app.agents.styles import DEFAULT_STYLE_ID, STYLE_IDS
 from app.config import get_settings
+from app.core.logging import log_exception
 from app.renderers.manim import render_code
 from app.tools.validator import extract_scene_name
 
 router = APIRouter(tags=["generate"])
+
+logger = logging.getLogger("thinkcanvas.api")
 
 
 class GenerateRequest(BaseModel):
@@ -95,7 +102,10 @@ async def generate_agent(req: GenerateRequest) -> GenerateResponse:
 
 
 @router.get("/generate/stream")
-async def generate_stream(prompt: str):
+async def generate_stream(
+    prompt: str,
+    style: str = Query(DEFAULT_STYLE_ID),
+):
     """SSE stream. Delegates to the standard agent then renders.
 
     Emits one ``code`` event (when the agent finishes), one ``rendering``
@@ -106,6 +116,8 @@ async def generate_stream(prompt: str):
 
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="prompt is empty")
+    if style not in STYLE_IDS:
+        raise HTTPException(status_code=400, detail=f"unknown style: {style}")
 
     async def event_generator():
         import json as _json
@@ -114,34 +126,106 @@ async def generate_stream(prompt: str):
         def _sse(event: str, data: dict) -> str:
             return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
+        from app.db.session import async_session_factory
+        from app.storage import tasks as task_store
+
+        # Step 5: persist every request so /tasks history survives reload.
+        async with async_session_factory() as session:
+            task = await task_store.create_task(session, prompt=prompt.strip(), style=style)
+            task_id = task.id
+
         try:
-            yield _sse("started", {"prompt": prompt})
-            result = await run_agent(prompt.strip(), max_iterations=6)
+            yield _sse("started", {"prompt": prompt, "task_id": task_id})
+
+            result = await run_agent(prompt.strip(), style_id=style, max_iterations=8)
+            tool_calls = len(result.get("tool_log", []))
             code = result.get("code")
+
             if not code:
-                yield _sse("failed", {"error": "agent failed to produce code"})
+                msgs = result.get("messages", [])
+                last_msg = str(msgs[-1])[:400] if msgs else ""
+                async with async_session_factory() as session:
+                    await task_store.update_task(
+                        session,
+                        task_id,
+                        status="failed",
+                        error="agent failed to produce code",
+                        tool_calls=tool_calls,
+                    )
+                yield _sse(
+                    "failed",
+                    {
+                        "error": "agent failed to produce code",
+                        "task_id": task_id,
+                        "tool_calls": tool_calls,
+                        "iterations": len(msgs),
+                        "last_message": last_msg,
+                    },
+                )
                 return
 
             scene_name = extract_scene_name(code)
-            yield _sse("code", {"code": code, "scene_name": scene_name})
+            yield _sse("code", {"code": code, "scene_name": scene_name, "task_id": task_id})
             yield _sse("rendering", {"scene_name": scene_name})
 
             render_result = await render_code(code, scene_name)
             if render_result.error or not render_result.video_path:
-                yield _sse("failed", {"error": render_result.error or "render failed"})
+                async with async_session_factory() as session:
+                    await task_store.update_task(
+                        session,
+                        task_id,
+                        status="failed",
+                        code=code,
+                        scene_name=scene_name,
+                        error=render_result.error or "no video",
+                        duration_sec=render_result.duration_sec,
+                        tool_calls=tool_calls,
+                    )
+                yield _sse(
+                    "failed",
+                    {"error": render_result.error or "render failed", "task_id": task_id},
+                )
                 return
 
+            video_url = to_video_url(render_result.video_path)
+            async with async_session_factory() as session:
+                await task_store.update_task(
+                    session,
+                    task_id,
+                    status="succeeded",
+                    code=code,
+                    scene_name=scene_name,
+                    video_url=video_url,
+                    duration_sec=render_result.duration_sec,
+                    tool_calls=tool_calls,
+                    clear_error=True,
+                )
             yield _sse(
                 "done",
                 {
                     "code": code,
                     "scene_name": scene_name,
-                    "video_url": to_video_url(render_result.video_path),
+                    "video_url": video_url,
                     "duration_sec": render_result.duration_sec,
+                    "task_id": task_id,
                 },
             )
-        except Exception as e:  # noqa: BLE001
-            yield _sse("failed", {"error": f"server error: {type(e).__name__}: {e}"})
+        except Exception:  # noqa: BLE001
+            log_exception(logger, "generate/stream unhandled error", prompt=prompt[:80])
+            try:
+                async with async_session_factory() as session:
+                    await task_store.update_task(
+                        session,
+                        task_id,
+                        status="failed",
+                        error="internal server error",
+                    )
+            except Exception:
+                log_exception(logger, "failed to write task error state")
+            yield _sse(
+                "failed",
+                {"error": "internal server error (see backend logs)", "task_id": task_id},
+            )
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

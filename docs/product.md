@@ -175,7 +175,7 @@ v1.0 跑通后的下一阶段重头戏是 **扩展算法谱与场景**：
 
 ### 已收敛
 - ✅ LLM 默认切到 **MiniMax-M3**：已通过 OpenAI 兼容 API 接入（[backend/app/llm/client.py](../..//backend/app/llm/client.py) + [backend/app/config.py](../../backend/app/config.py)）
-- ✅ MiniMax 不支持 `tool_calls`：被迫手写 agent loop + LangChain 零件，详见 [docs/session-summary.md](session-summary.md)
+- ✅ MiniMax 协议差异通过 LiteLLM 内嵌归一化，业务层用 LangChain 1.x 标准 `create_agent` + `response_format=CodeOutput`，详见 [docs/session-summary.md](session-summary.md#session-2-litellm-适配层--标准-langchain-1x-重构2026-08-06)
 
 ### 本次讨论新增
 - [ ] 伪代码 / 截图 的处理路径：LLM 直接读，还是先结构化解析再喂？

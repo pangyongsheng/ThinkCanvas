@@ -2,264 +2,277 @@
 
 import { useRef, useState } from "react";
 import {
-  ApiError,
-  renderManim,
-  subscribeGenerate,
+  ConversationDetail,
+  ConversationRecord,
+  MessageRecord,
+  STYLES,
+  StyleId,
+  createConversation,
+  getConversation,
+  subscribeRefine,
 } from "@/lib/api";
 
-type Status = "idle" | "generating" | "rendering" | "done" | "failed";
+import { HistorySidebar } from "@/components/HistorySidebar";
+import { CodeViewer } from "@/components/CodeViewer";
+import { ConversationPanel } from "@/components/ConversationPanel";
 
-const STATUS_LABEL: Record<Status, string> = {
-  idle: "就绪",
-  generating: "正在生成代码…",
-  rendering: "正在渲染视频…",
-  done: "完成",
-  failed: "失败",
-};
+type Status = "idle" | "creating" | "generating" | "rendering" | "done" | "failed";
 
-export default function Home() {
-  const [prompt, setPrompt] = useState("");
+// Tiny helper to mint stable-but-temp ids for optimistic messages.
+function tempId(prefix: string): string {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export default function Page() {
+  // ----- top-level state -----
+  const [activeConversation, setActiveConversation] = useState<ConversationDetail | null>(null);
   const [status, setStatus] = useState<Status>("idle");
+  const [statusLabel, setStatusLabel] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
-  const [lastStep, setLastStep] = useState<string>("");
-  const [code, setCode] = useState<string | null>(null);
-  const [sceneName, setSceneName] = useState<string | null>(null);
-  const [attempts, setAttempts] = useState<number | null>(null);
-  const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [renderDuration, setRenderDuration] = useState<number | null>(null);
+  const [style, setStyle] = useState<StyleId>("3b1b");
 
-  // Keep cancellation handle so a new run can close the old EventSource.
-  const closeRef = useRef<(() => void) | null>(null);
+  // sidebar refresh trigger — bumped after any successful op
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
 
-  function runPipeline(reRenderOnly = false) {
+  // abort handle for refine SSE stream
+  const abortRef = useRef<(() => void) | null>(null);
+
+  // ----- derived -----
+  const latestAssistant = activeConversation
+    ? [...activeConversation.messages].reverse().find((m) => m.role === "assistant") ?? null
+    : null;
+  const currentCode = latestAssistant?.code ?? null;
+  const currentVideo = latestAssistant?.video_url ?? null;
+  const currentScene = latestAssistant?.scene_name ?? null;
+  const busy = status === "creating" || status === "generating" || status === "rendering";
+
+  function clearError() {
     setError(null);
-    if (!reRenderOnly) setVideoUrl(null);
+  }
 
-    if (closeRef.current) {
-      closeRef.current();
-      closeRef.current = null;
+  function reset() {
+    abortRef.current?.();
+    abortRef.current = null;
+    setActiveConversation(null);
+    setError(null);
+    setStatus("idle");
+    setStatusLabel("");
+  }
+
+  function handleNew() {
+    reset();
+  }
+
+  async function handlePick(c: ConversationRecord) {
+    try {
+      const detail = await getConversation(c.id);
+      setActiveConversation(detail);
+      setError(null);
+      setStatus("done");
+      setStatusLabel(`已加载 v${detail.version}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
+  }
 
-    if (reRenderOnly) {
-      // Just hit POST /render — no SSE needed for a single subprocess call.
-      void runReRender();
+  // ----- main entry: any text input goes through handleSend -----
+  async function handleSend(instruction: string) {
+    const text = instruction.trim();
+    if (!text) return;
+    clearError();
+
+    // No active conversation yet -> this is the first turn.
+    if (!activeConversation) {
+      await handleCreateFirst(text);
       return;
     }
 
-    if (!prompt.trim()) {
-      setError("prompt is empty");
+    // Subsequent turns run through refine.
+    await handleRefine(text);
+  }
+
+  async function handleCreateFirst(prompt: string) {
+    setStatus("creating");
+    setStatusLabel("创建对话 + 首次生成");
+
+    // Optimistic local conversation so the user sees their prompt bubble
+    // immediately instead of after the backend round-trip.
+    const optimistic: ConversationDetail = {
+      id: tempId("conv"),
+      title: prompt.slice(0, 20),
+      style,
+      version: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      messages: [
+        {
+          id: tempId("msg"),
+          role: "user",
+          content: prompt,
+          code: null,
+          video_url: null,
+          scene_name: null,
+          duration_sec: null,
+          status: "ok",
+          error: null,
+          created_at: new Date().toISOString(),
+        },
+      ],
+    };
+    setActiveConversation(optimistic);
+
+    try {
+      const created = await createConversation(prompt, style);
+      const fresh = await getConversation(created.conversation.id);
+      setActiveConversation(fresh);
+      setStatus("done");
+      setStatusLabel("完成");
+      setHistoryRefreshKey((k) => k + 1);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
       setStatus("failed");
+      setStatusLabel("失败");
+      setActiveConversation(null);
       return;
     }
 
-    setStatus("generating");
-    setCode(null);
-    setAttempts(null);
+  }
 
-    const close = subscribeGenerate(prompt.trim(), {
-      llm_call: (d) => {
-        setStatus("generating");
-        setLastStep(`调用 LLM（第 ${d.attempt} 次）`);
-      },
-      validating: (d) => {
-        setLastStep(`校验代码（第 ${d.attempt} 次）`);
-      },
-      code: (d) => {
-        setCode(d.code);
-        setSceneName(d.scene_name);
-        setAttempts(d.attempts);
-        setLastStep(`代码 OK，准备渲染`);
-      },
-      rendering: (d) => {
-        setStatus("rendering");
-        setLastStep(`渲染 ${d.scene_name ?? ""}`);
-      },
-      retry: (d) => {
-        setLastStep(
-          `第 ${d.attempt} 次失败（${d.reason}）${d.error ? "，自动重试" : ""}`,
-        );
-      },
-      done: (d) => {
-        setCode(d.code);
-        setSceneName(d.scene_name);
-        setAttempts(d.attempts);
-        setVideoUrl(d.video_url);
-        setRenderDuration(d.duration_sec);
+  async function handleRefine(instruction: string) {
+    if (!activeConversation) return;
+    setStatus("generating");
+    setStatusLabel("正在调整…");
+    abortRef.current?.();
+
+    // Optimistic append: show user bubble immediately.
+    const optimisticUserMsg: MessageRecord = {
+      id: tempId("msg"),
+      role: "user",
+      content: instruction,
+      code: null,
+      video_url: null,
+      scene_name: null,
+      duration_sec: null,
+      status: "ok",
+      error: null,
+      created_at: new Date().toISOString(),
+    };
+    setActiveConversation((prev) =>
+      prev
+        ? { ...prev, messages: [...prev.messages, optimisticUserMsg] }
+        : prev,
+    );
+
+    const idAtSubscribe = activeConversation.id;
+
+    abortRef.current = subscribeRefine(idAtSubscribe, instruction, {
+      started: () => setStatusLabel("开始调整…"),
+      generating: () => setStatusLabel("调用模型…"),
+      code: () => setStatusLabel("渲染中…"),
+      rendering: () => setStatus("rendering"),
+      done: async () => {
+        const fresh = await getConversation(idAtSubscribe);
+        // Only apply if we're still on the same conversation (no race).
+        setActiveConversation((cur) => (cur?.id === idAtSubscribe ? fresh : cur));
         setStatus("done");
-        setLastStep("完成");
-        if (closeRef.current) {
-          closeRef.current();
-          closeRef.current = null;
-        }
+        setStatusLabel("完成");
+        setHistoryRefreshKey((k) => k + 1);
       },
       failed: (d) => {
-        setError(d.error);
         setStatus("failed");
-        setLastStep("失败");
-        if (closeRef.current) {
-          closeRef.current();
-          closeRef.current = null;
-        }
+        setStatusLabel("失败");
+        setError(d.error ?? "未知错误");
       },
     });
-    closeRef.current = close;
   }
-
-  async function runReRender() {
-    if (!code) return;
-    setStatus("rendering");
-    setError(null);
-    try {
-      const ren = await renderManim(code, sceneName ?? undefined);
-      if (ren.error || !ren.video_url) {
-        setError(ren.error ?? "render failed");
-        setStatus("failed");
-        return;
-      }
-      setVideoUrl(ren.video_url);
-      setRenderDuration(ren.duration_sec);
-      setStatus("done");
-    } catch (e) {
-      const msg = e instanceof ApiError ? describeApiError(e) : String(e);
-      setError(`渲染失败：${msg}`);
-      setStatus("failed");
-    }
-  }
-
-  const busy = status === "generating" || status === "rendering";
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-10">
-      <header>
-        <h1 className="text-4xl font-bold text-blue-400">ThinkCanvas</h1>
-        <p className="mt-1 text-sm text-gray-500">Prompt → Manim 视频（SSE 实时进度）</p>
-      </header>
+    <main className="flex h-screen gap-3 bg-gray-950 p-3 text-gray-100">
+      <HistorySidebar
+        refreshKey={historyRefreshKey}
+        selectedId={activeConversation?.id ?? null}
+        onPick={handlePick}
+        onNew={handleNew}
+      />
 
-      <section className="rounded-lg border border-gray-800 bg-gray-900 p-4">
-        <label htmlFor="prompt" className="block text-sm text-gray-400">
-          算法描述（中文 / 英文）
-        </label>
-        <textarea
-          id="prompt"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="例：冒泡排序 / binary search / 二叉树 BFS 遍历"
-          rows={3}
-          className="mt-2 w-full rounded bg-gray-950 p-2 font-mono text-sm text-white outline-none ring-1 ring-gray-800 focus:ring-blue-500"
-          disabled={busy}
-        />
-        <div className="mt-3 flex items-center gap-3">
-          <button
-            onClick={() => runPipeline(false)}
-            disabled={busy}
-            className="rounded bg-blue-600 px-4 py-2 text-sm font-medium hover:bg-blue-500 disabled:bg-gray-700"
-          >
-            {busy ? STATUS_LABEL[status] : "Generate"}
-          </button>
-          <span className="text-sm text-gray-400">{STATUS_LABEL[status]}</span>
-          {lastStep && (
-            <span className="text-xs text-gray-500">— {lastStep}</span>
-          )}
-          {attempts !== null && status === "done" && (
-            <span className="text-xs text-gray-500">（retry {attempts} 次）</span>
-          )}
-          {renderDuration !== null && status === "done" && (
-            <span className="text-xs text-gray-500">渲染 {renderDuration.toFixed(1)}s</span>
-          )}
-        </div>
-        {error && (
-          <pre className="mt-3 max-h-60 overflow-auto rounded bg-red-950 p-3 text-xs text-red-200">
-            {error}
-          </pre>
+      <div className="flex min-w-0 flex-1 flex-col gap-3">
+        <Header style={style} setStyle={setStyle} />
+
+        {activeConversation ? (
+          <CodeViewer
+            videoUrl={currentVideo}
+            code={currentCode}
+            sceneName={currentScene}
+          />
+        ) : (
+          <EmptyState />
         )}
 
-        <ProgressBar status={status} />
-      </section>
-
-      {code && (
-        <section className="rounded-lg border border-gray-800 bg-gray-900 p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-gray-300">
-              生成的代码 {sceneName && <span className="ml-2 text-xs text-gray-500">({sceneName})</span>}
-            </h2>
-            <button
-              onClick={() => runPipeline(true)}
-              disabled={busy}
-              className="rounded bg-gray-800 px-3 py-1 text-xs hover:bg-gray-700 disabled:bg-gray-700"
-            >
-              重新渲染
-            </button>
+        {error && (
+          <div className="rounded border border-red-700 bg-red-950/40 p-3 text-sm text-red-200">
+            {error}
           </div>
-          <pre className="max-h-96 overflow-auto rounded bg-gray-950 p-3 text-xs text-gray-200">
-            <code>{code}</code>
-          </pre>
-        </section>
-      )}
+        )}
+      </div>
 
-      {videoUrl && (
-        <section className="rounded-lg border border-gray-800 bg-gray-900 p-4">
-          <h2 className="mb-2 text-sm font-semibold text-gray-300">视频</h2>
-          <video
-            src={videoUrl}
-            controls
-            className="w-full rounded bg-black"
-          />
-          <a
-            href={videoUrl}
-            download
-            className="mt-2 inline-block text-xs text-blue-400 hover:underline"
-          >
-            下载 .mp4
-          </a>
-        </section>
-      )}
+      <ConversationPanel
+        messages={activeConversation?.messages ?? []}
+        busy={busy}
+        status={statusLabel}
+        onSend={handleSend}
+        disabled={busy}
+        // Empty conversation: show a welcoming placeholder.
+        placeholder={
+          activeConversation
+            ? "还想调整什么？例如：把背景换成白色"
+            : "描述一下你想看的动画，从这里开始"
+        }
+      />
     </main>
   );
 }
 
-function describeApiError(e: ApiError): string {
-  let d: unknown = e.detail;
-  if (d && typeof d === "object" && "detail" in (d as Record<string, unknown>)) {
-    d = (d as Record<string, unknown>).detail;
-  }
-  if (d && typeof d === "object" && "error" in (d as Record<string, unknown>)) {
-    return String((d as Record<string, unknown>).error);
-  }
-  if (typeof d === "string") return d;
-  return e.message;
+function EmptyState() {
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center rounded-lg border border-gray-800 bg-gray-900 p-8 text-center">
+      <p className="text-sm text-gray-400">
+        还没有对话，在右侧输入想看的动画开始吧
+      </p>
+      <p className="mt-2 text-xs text-gray-600">
+        例如：冒泡排序、二分查找、梯形面积、勾股定理…
+      </p>
+    </div>
+  );
 }
 
-const PIPELINE_STEPS = ["提交请求", "生成代码", "校验代码", "渲染视频"];
-
-function ProgressBar({ status }: { status: Status }) {
-  const STEP_INDEX: Record<Status, number> = {
-    idle: 0,
-    generating: 1,
-    rendering: 3,
-    done: PIPELINE_STEPS.length,
-    failed: 1,
-  };
-  const idx = STEP_INDEX[status];
-  const total = PIPELINE_STEPS.length;
-  const pct = Math.min(100, Math.round(((idx + 0.5) / total) * 100));
-
+function Header({
+  style,
+  setStyle,
+}: {
+  style: StyleId;
+  setStyle: (s: StyleId) => void;
+}) {
   return (
-    <div className="mt-3" data-testid="progress-bar">
-      <div className="h-2 w-full overflow-hidden rounded bg-gray-800">
-        <div
-          className={`h-full transition-all duration-300 ${
-            status === "failed" ? "bg-red-500" : "bg-blue-500"
-          }`}
-          style={{ width: `${pct}%` }}
-        />
+    <header className="flex items-center justify-between rounded-lg border border-gray-800 bg-gray-900 px-4 py-3">
+      <div>
+        <h1 className="text-xl font-bold text-blue-400">ThinkCanvas</h1>
+        <p className="text-xs text-gray-500">文字 → Manim 视频 · 多轮对话</p>
       </div>
-      <div className="mt-1 flex justify-between text-xs text-gray-500">
-        {PIPELINE_STEPS.map((s, i) => (
-          <span key={s} className={i <= idx ? "text-blue-400" : "text-gray-600"}>
-            {s}
-          </span>
-        ))}
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-gray-500">风格</span>
+        <select
+          value={style}
+          onChange={(e) => setStyle(e.target.value as StyleId)}
+          disabled={false}
+          className="rounded border border-gray-700 bg-gray-950 px-2 py-1 text-sm text-gray-100"
+        >
+          {STYLES.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label}
+            </option>
+          ))}
+        </select>
       </div>
-    </div>
+    </header>
   );
 }

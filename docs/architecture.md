@@ -27,7 +27,7 @@
 - ❌ ~~Redis + RQ Worker 异步队列~~ — **未实现**；当前所有渲染在 API 进程内同步执行
 - ❌ ~~WebSocket 推送进度~~ — **改用 SSE**（`GET /api/v1/generate/stream`）
 - ✅ MiniMax-M3 作为默认 LLM（不是 DeepSeek）
-- ✅ LangChain 零件（parser / LCEL） + 手写 agent loop（不是 LangGraph 状态机）
+- ✅ **2026-08 升级**：标准 LangChain 1.x `create_agent` + LiteLLM 适配层（手写 loop 已删除）
 
 ## 🔄 数据流（端到端）
 
@@ -79,8 +79,8 @@
 | **默认** | **MiniMax-M3** | MiniMax（OpenAI 兼容 API） | ✅ |
 | 备胎 | DeepSeek-V3 / Qwen2.5-Coder | — | 🔜 留切换位 |
 
-> **MiniMax 不支持 `tool_calls`**，因此不能直接用 LangChain 的 `bind_tools` / `create_agent` / LangGraph `create_react_agent`。当前实现是**手写 agent loop + LangChain 零件**（parser / LCEL）。
-> 详见 [docs/session-summary.md](session-summary.md)。
+> ~~MiniMax 不支持 `tool_calls`~~ → **2026-08 已解决**：通过 `langchain-litellm.ChatLiteLLM`（库内嵌归一化），业务层用标准 `langchain_openai.ChatOpenAI` + `langchain.agents.create_agent` 全套写法。换厂商只改 `app/llm/client.py` 一个文件。
+> 详见 [docs/session-summary.md](session-summary.md#session-2-litellm-适配层--标准-langchain-1x-重构2026-08-06)。
 
 ### 渲染
 | 技术 | 用途 | 状态 |
@@ -105,18 +105,16 @@ backend/
 │   ├── main.py                       # FastAPI 入口
 │   ├── config.py                     # 读项目根 .env；model_name="MiniMax-M3"
 │   ├── agents/
-│   │   ├── react_coder.py            # ⚠️ 死代码：LangGraph ReAct（MiniMax 不支持 tool_calls）
-│   │   ├── tools.py                  # ⚠️ 死代码：@tool 装饰的 validate_manim_code / render_manim_dryrun
-│   │   └── coder/                    # ✅ 实际使用的 agent
-│   │       ├── __init__.py
-│   │       ├── parser.py             # CodeOutput + parse_with_fallback + strip_think_blocks
-│   │       ├── chain.py              # PROMPT_TEMPLATE + build_chain (RunnableSequence)
-│   │       ├── retry.py              # load_system_prompt + build_user_message + validate_only_retry
-│   │       ├── coder.py              # CoderAgent 类 + AgentStep + AgentResult
-│   │       ├── sync.py               # run_sync + GenerateOutcome
-│   │       └── stream.py             # run_streaming（SSE 流式）
+│   │   ├── tools.py                  # @tool 装饰的 validate_manim_code / render_manim_dryrun（被 builder.py 装载，是活的核心）
+│   │   ├── builder.py                # LangChain create_agent 工厂 + @lru_cache（活的核心）
+│   │   ├── state.py                  # CodeOutput Pydantic schema（response_format 用）
+│   │   ├── styles.py                 # 3 个 style 注册（academic / 3b1b / minimal）
+│   │   ├── react_coder.py            # run_agent + _invoke_and_extract：run_agent 给 /generate 路径；_invoke_and_extract 还被 refine 复用（活的核心）
+│   │   └── refine.py                 # refine mode：拼装 prev_code + instruction，再调一次 create_agent
 │   ├── api/v1/
-│   │   ├── generate.py               # POST /generate (legacy), GET /generate/stream (生产用), POST /generate/agent (死)
+│   │   ├── generate.py               # POST /generate, GET /generate/stream (前端调用中，生产路径之一), POST /generate/agent (死)
+│   │   ├── conversations.py          # POST /conversations, GET /conversations, POST /conversations/{id}/refine (SSE), DELETE /conversations/{id} ＋ conversation + message 双表存储
+│   │   ├── tasks.py                  # 老 task CRUD，暂留作为历史 (Step 5 后废弃)
 │   │   ├── render.py                 # POST /render
 │   │   ├── health.py                 # GET /health
 │   │   └── readyz.py                 # GET /readyz
@@ -147,8 +145,8 @@ docker/docker-compose.yml             # postgres + redis（redis 未接业务）
 ### ADR-001 · 默认 LLM 切换为 MiniMax-M3
 - **决策**：默认从 DeepSeek-V3 切到 **MiniMax-M3**
 - **理由**：公司内部模型、可控；OpenAI 兼容 API
-- **代价**：不支持 `tool_calls`，被迫手写 agent loop
-- **缓解**：用 LangChain 的零件（parser / LCEL）但不用 agent 大脑
+- **代价**（~~不支持 `tool_calls`，被迫手写 agent loop~~ → **2026-08 缓解**）
+- **现状**：通过 `langchain-litellm` 内嵌归一化，业务层用标准 LangChain 1.x 写法
 
 ### ADR-002 · 同步渲染，不上 Worker（v1.0 简化）
 - **决策**：渲染在 API 进程内同步执行，**不**接 Redis / RQ Worker
@@ -164,10 +162,10 @@ docker/docker-compose.yml             # postgres + redis（redis 未接业务）
 ### ADR-004 · ManimCE 而非 ManimGL
 - 同原版，未变
 
-### ADR-005 · LangChain 零件 + 手写 loop（不绑 LangGraph）
-- **决策**：用 `langchain-openai` 的 ChatOpenAI、`PydanticOutputParser`、`StrOutputParser`、`RunnableSequence`，但 agent 大脑**手写**
-- **理由**：MiniMax 不支持 tool_calls；LangGraph ReAct 跑不通
-- **迁移路径**：未来若换支持 tool_calls 的 LLM（如 GPT-4o），可平滑迁移到 `langgraph.StateGraph`
+### ADR-005 · 标准 LangChain 1.x `create_agent` + LiteLLM 适配层（2026-08 升级）
+- **决策**：用 `langchain.agents.create_agent(model=, tools=, system_prompt=, response_format=)` 标准 API；模型层 `langchain-litellm.ChatLiteLLM` 封装为 `ChatOpenAI` 类型
+- **理由**：MiniMax 协议归一化交给 LiteLLM；业务层 100% 标准 LangChain 写法；换厂商只改 `client.py`
+- **迁移路径**：未来换原生支持 tool_calls 的 LLM（GPT-4o 等），`client.py` 一行 import 切换即可
 
 ## 🚨 安全考虑
 
@@ -196,7 +194,7 @@ docker/docker-compose.yml             # postgres + redis（redis 未接业务）
 | **持久化** | Step 5 — user / history 表 + alembic 迁移 + 中英切换 | 高 |
 | **few-shot 库** | v1.0 要求 3 个算法，目前 system prompt 里只塞了冒泡排序 | 高 |
 | **Docker 沙箱** | v0.2 计划 | 中 |
-| **LangGraph 状态机** | 当前手写 loop，未来用 `langgraph.StateGraph` 重构 agent | 中 |
+| **LangGraph 状态机** | 备选方案；当前 `create_agent` 已足够，未来加多 Agent 编排时再评估 | 低 |
 | **LangSmith / LangFuse** | 可观测 | 中 |
 | **OSS / S3** | 视频存储 | 低 |
 | **多 LLM 切换** | DeepSeek-V3 / Qwen2.5-Coder 备胎 | 低 |

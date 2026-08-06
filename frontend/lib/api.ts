@@ -16,6 +16,21 @@ export interface RenderResult {
   error: string | null;
 }
 
+export interface TaskRecord {
+  id: string;
+  prompt: string;
+  code: string | null;
+  scene_name: string | null;
+  video_url: string | null;
+  status: "pending" | "succeeded" | "failed" | string;
+  style: StyleId | string;
+  duration_sec: number;
+  error: string | null;
+  tool_calls: number;
+  created_at: string;
+  updated_at: string;
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BACKEND_URL}${path}`, {
     ...init,
@@ -67,10 +82,42 @@ export async function renderManim(
 }
 
 // ---------------------------------------------------------------------------
+// Task history (Step 5)
+// ---------------------------------------------------------------------------
+
+export async function listTasks(limit = 50): Promise<TaskRecord[]> {
+  return fetchJson<TaskRecord[]>(`/api/v1/tasks?limit=${limit}`);
+}
+
+export async function getTask(id: string): Promise<TaskRecord> {
+  return fetchJson<TaskRecord>(`/api/v1/tasks/${id}`);
+}
+
+export async function deleteTask(id: string): Promise<{ deleted: string }> {
+  return fetchJson<{ deleted: string }>(`/api/v1/tasks/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export type StyleId = "3b1b" | "minimal" | "academic";
+
+export interface StyleOption {
+  id: StyleId;
+  label: string;
+}
+
+export const STYLES: StyleOption[] = [
+  { id: "3b1b", label: "3Blue1Brown（深色鲜艳）" },
+  { id: "minimal", label: "Minimal（深色极简）" },
+  { id: "academic", label: "Academic（明亮学术）" },
+];
+
+// ---------------------------------------------------------------------------
 // SSE: subscribeGenerate
 // ---------------------------------------------------------------------------
 
 export type StreamEvent =
+  | "started"
   | "llm_call"
   | "validating"
   | "code"
@@ -80,9 +127,15 @@ export type StreamEvent =
   | "failed";
 
 export interface StreamHandlers {
+  started?: (data: { prompt: string; task_id?: string }) => void;
   llm_call?: (data: { step: string; attempt: number }) => void;
   validating?: (data: { attempt: number }) => void;
-  code?: (data: { code: string; scene_name: string; attempts: number }) => void;
+  code?: (data: {
+    code: string;
+    scene_name: string;
+    attempts: number;
+    task_id?: string;
+  }) => void;
   rendering?: (data: { scene_name?: string }) => void;
   retry?: (data: { reason: string; attempt: number; error?: string }) => void;
   done?: (data: {
@@ -91,16 +144,26 @@ export interface StreamHandlers {
     video_url: string;
     attempts: number;
     duration_sec: number;
+    task_id?: string;
   }) => void;
-  failed?: (data: { error: string; history?: unknown[] }) => void;
+  failed?: (data: {
+    error: string;
+    history?: unknown[];
+    task_id?: string;
+    tool_calls?: number;
+    iterations?: number;
+    last_message?: string;
+  }) => void;
 }
 
 export function subscribeGenerate(
   prompt: string,
   handlers: StreamHandlers,
+  style: StyleId = "3b1b",
 ): () => void {
   const url = new URL("/api/v1/generate/stream", BACKEND_URL);
   url.searchParams.set("prompt", prompt);
+  url.searchParams.set("style", style);
   const es = new EventSource(url.toString());
 
   for (const [name, fn] of Object.entries(handlers)) {
@@ -115,4 +178,153 @@ export function subscribeGenerate(
   }
 
   return () => es.close();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-turn conversations (v1.x)
+// ---------------------------------------------------------------------------
+
+export interface ConversationRecord {
+  id: string;
+  title: string;
+  style: StyleId | string;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MessageRecord {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  code: string | null;
+  video_url: string | null;
+  scene_name: string | null;
+  duration_sec: number | null;
+  status: string;
+  error: string | null;
+  created_at: string;
+}
+
+export interface ConversationDetail extends ConversationRecord {
+  messages: MessageRecord[];
+}
+
+export interface CreateConversationResult {
+  conversation: ConversationRecord;
+  message: MessageRecord;
+  assistant_message: MessageRecord | null;
+  code: string | null;
+  video_url: string | null;
+  duration_sec: number | null;
+  scene_name: string | null;
+}
+
+export async function createConversation(
+  prompt: string,
+  style: StyleId = "3b1b",
+): Promise<CreateConversationResult> {
+  return fetchJson<CreateConversationResult>("/api/v1/conversations", {
+    method: "POST",
+    body: JSON.stringify({ prompt, style }),
+  });
+}
+
+export async function listConversations(limit = 50): Promise<ConversationRecord[]> {
+  return fetchJson<ConversationRecord[]>(`/api/v1/conversations?limit=${limit}`);
+}
+
+export async function getConversation(id: string): Promise<ConversationDetail> {
+  return fetchJson<ConversationDetail>(`/api/v1/conversations/${id}`);
+}
+
+export async function deleteConversation(id: string): Promise<{ deleted: string }> {
+  return fetchJson<{ deleted: string }>(`/api/v1/conversations/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export interface RefineStreamHandlers {
+  started?: (data: { conversation_id: string; user_message_id: string }) => void;
+  generating?: (data: { instruction: string }) => void;
+  code?: (data: { code: string; scene_name: string }) => void;
+  rendering?: (data: { scene_name?: string }) => void;
+  done?: (data: {
+    code: string;
+    video_url: string;
+    scene_name: string;
+    duration_sec: number;
+  }) => void;
+  failed?: (data: {
+    error: string;
+    tool_calls?: number;
+    last_message?: string;
+  }) => void;
+}
+
+export function subscribeRefine(
+  conversationId: string,
+  instruction: string,
+  handlers: RefineStreamHandlers,
+): () => void {
+  const controller = new AbortController();
+  const url = `${BACKEND_URL}/api/v1/conversations/${encodeURIComponent(
+    conversationId,
+  )}/refine`;
+  (async () => {
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instruction }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      handlers.failed?.({ error: String(err) });
+      return;
+    }
+    if (!res.ok || !res.body) {
+      handlers.failed?.({ error: `HTTP ${res.status}` });
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch (err) {
+        handlers.failed?.({ error: String(err) });
+        return;
+      }
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      // SSE frames are separated by a blank line, each one starting with
+      // "event: <name>\n" and "data: <json>\n".
+      let frameEnd: number;
+      while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, frameEnd);
+        buffer = buffer.slice(frameEnd + 2);
+        const lines = frame.split("\n");
+        let eventName = "message";
+        let data = "";
+        for (const line of lines) {
+          if (line.startsWith("event:")) eventName = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+        const fn = (handlers as Record<string, ((d: unknown) => void) | undefined>)[eventName];
+        if (!fn) continue;
+        try {
+          fn(JSON.parse(data));
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+  })();
+
+  return () => controller.abort();
 }
