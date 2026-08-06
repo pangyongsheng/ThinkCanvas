@@ -11,7 +11,12 @@ from alembic import context
 from app.config import get_settings
 from app.db.session import Base
 # Import all models so Base.metadata is populated
+# Import all models so Base.metadata is populated
 from app.db.models import task  # noqa: F401
+from app.db.models import conversation  # noqa: F401
+from app.db.models import message  # noqa: F401
+from app.db.models import user  # noqa: F401
+from app.db.models import few_shot  # noqa: F401
 
 config = context.config
 

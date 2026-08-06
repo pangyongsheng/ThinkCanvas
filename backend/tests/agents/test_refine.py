@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 
-from app.agents.state import CodeOutput
+from app.agents.schemas import CodeOutput
 
 
 RUNNABLE_CODE = (
@@ -30,9 +30,28 @@ RUNNABLE_CODE = (
 )
 
 
-def _patch_create_agent(fake_agent):
-    """Patch the seam where ``run_refine`` builds its agent."""
-    return patch("app.agents.refine.create_agent", return_value=fake_agent)
+@pytest.fixture(autouse=True)
+def _clear_agent_cache():
+    """Reset ``builder.build_agent`` lru_cache around each test.
+
+    Refine goes through ``builder.build_agent(extra_system_prompt=...)``,
+    which is lru_cached. Cached stubs from earlier tests would leak into
+    later ones otherwise.
+    """
+    from app.agents import builder
+
+    builder.build_agent.cache_clear()
+    yield
+    builder.build_agent.cache_clear()
+
+
+def _patch_build_agent(fake_agent):
+    """Patch the seam where ``run_refine`` fetches its agent.
+
+    Use as a context manager. The autouse fixture above keeps the
+    lru_cache empty so the patched return value is what refine sees. Note: we patch ``app.agents.refine.build_agent`` (not the one in builder) because refine imported it directly into its own namespace..
+    """
+    return patch("app.agents.refine.build_agent", return_value=fake_agent)
 
 
 @pytest.mark.asyncio
@@ -50,7 +69,7 @@ async def test_refine_returns_code_when_structured_response_present():
         }
     fake_agent.ainvoke = _fake_ainvoke
 
-    with _patch_create_agent(fake_agent):
+    with _patch_build_agent(fake_agent):
         from app.agents.refine import run_refine
         result = await run_refine(
             prev_code="from manim import *\n\nclass Old(Scene):\n    pass\n",
@@ -92,7 +111,7 @@ async def test_refine_recovers_code_from_thinking_blocks():
         }
     fake_agent.ainvoke = _fake_ainvoke
 
-    with _patch_create_agent(fake_agent):
+    with _patch_build_agent(fake_agent):
         from app.agents.refine import run_refine
         result = await run_refine(
             prev_code="# old\n",
@@ -101,6 +120,81 @@ async def test_refine_recovers_code_from_thinking_blocks():
         )
 
     assert result["code"].rstrip() == RUNNABLE_CODE.rstrip()
+
+
+@pytest.mark.asyncio
+async def test_refine_includes_user_history_in_prompt():
+    """User history should appear in the prompt before the latest code,
+    so the LLM understands progressive refinement.
+    """
+    from langchain_core.messages import HumanMessage
+
+    fake_agent = MagicMock()
+    captured: dict = {}
+
+    async def _fake_ainvoke(invoke_input, config=None):
+        # Capture the user message so we can assert on its content.
+        captured["messages"] = invoke_input["messages"]
+        return {
+            "messages": [AIMessage(content="done")],
+            "structured_response": CodeOutput(thought="ok", code=RUNNABLE_CODE),
+        }
+    fake_agent.ainvoke = _fake_ainvoke
+
+    with _patch_build_agent(fake_agent):
+        from app.agents.refine import run_refine
+        await run_refine(
+            prev_code=RUNNABLE_CODE,
+            instruction="and now make the background red",
+            style_id="3b1b",
+            user_history=[
+                "show trapezoid area",
+                "highlight the height in blue",
+            ],
+        )
+
+    assert len(captured["messages"]) == 1
+    user_msg = captured["messages"][0]
+    assert isinstance(user_msg, HumanMessage)
+    body = user_msg.content
+    assert "[历史用户指令]" in body
+    assert "- show trapezoid area" in body
+    assert "- highlight the height in blue" in body
+    assert "[上一版代码]" in body
+    # Current instruction is highlighted separately, not in the history bullets.
+    assert "[本次用户调整要求]" in body
+    assert "and now make the background red" in body
+
+
+@pytest.mark.asyncio
+async def test_refine_omits_history_block_when_empty():
+    """First refinement in a conversation has no user history yet."""
+    from langchain_core.messages import HumanMessage
+
+    fake_agent = MagicMock()
+    captured: dict = {}
+
+    async def _fake_ainvoke(invoke_input, config=None):
+        captured["messages"] = invoke_input["messages"]
+        return {
+            "messages": [AIMessage(content="ok")],
+            "structured_response": CodeOutput(thought="ok", code=RUNNABLE_CODE),
+        }
+    fake_agent.ainvoke = _fake_ainvoke
+
+    with _patch_build_agent(fake_agent):
+        from app.agents.refine import run_refine
+        await run_refine(
+            prev_code=RUNNABLE_CODE,
+            instruction="red background",
+            style_id="3b1b",
+            user_history=[],
+        )
+
+    body = captured["messages"][0].content
+    assert "[历史用户指令]" not in body
+    assert "[上一版代码]" in body
+    assert "[本次用户调整要求]" in body
 
 
 @pytest.mark.asyncio
@@ -114,7 +208,7 @@ async def test_refine_returns_none_when_no_code_anywhere():
         }
     fake_agent.ainvoke = _fake_ainvoke
 
-    with _patch_create_agent(fake_agent):
+    with _patch_build_agent(fake_agent):
         from app.agents.refine import run_refine
         result = await run_refine(prev_code="# old\n", instruction="anything")
 
@@ -174,7 +268,7 @@ async def test_refine_extracts_python_fence_from_thinking_block():
         }
     fake_agent.ainvoke = _fake_ainvoke
 
-    with _patch_create_agent(fake_agent):
+    with _patch_build_agent(fake_agent):
         from app.agents.refine import run_refine
         result = await run_refine(
             prev_code="# old\n",
@@ -213,7 +307,7 @@ async def test_refine_retries_when_output_looks_truncated():
 
     fake_agent.ainvoke = _fake_ainvoke
 
-    with _patch_create_agent(fake_agent):
+    with _patch_build_agent(fake_agent):
         from app.agents.refine import run_refine
         result = await run_refine(prev_code="# old\n", instruction="x", style_id="3b1b")
 

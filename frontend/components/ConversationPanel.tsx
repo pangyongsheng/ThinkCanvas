@@ -10,6 +10,8 @@ interface Props {
   status?: string;
   /** Called when the user submits the bottom input box. */
   onSend: (instruction: string) => void;
+  /** Called when the user clicks "👍 收藏为范例" on an assistant bubble. */
+  onSaveAsFewShot?: (message: MessageRecord) => void;
   /** Disable input (used during refine generation). */
   disabled?: boolean;
   /** Default: "还想调整什么？例如：把背景换成白色" */
@@ -29,6 +31,7 @@ export function ConversationPanel({
   busy,
   status,
   onSend,
+  onSaveAsFewShot,
   disabled,
   placeholder,
 }: Props) {
@@ -59,7 +62,11 @@ export function ConversationPanel({
           <p className="text-center text-xs text-gray-500">对话还没开始</p>
         )}
         {messages.map((m) => (
-          <Bubble key={m.id} m={m} />
+          <Bubble
+            key={m.id}
+            m={m}
+            onSaveAsFewShot={m.role === "assistant" ? onSaveAsFewShot : undefined}
+          />
         ))}
         {busy && (
           <div className="flex justify-start">
@@ -101,7 +108,13 @@ export function ConversationPanel({
   );
 }
 
-function Bubble({ m }: { m: MessageRecord }) {
+function Bubble({
+  m,
+  onSaveAsFewShot,
+}: {
+  m: MessageRecord;
+  onSaveAsFewShot?: (m: MessageRecord) => void;
+}) {
   if (m.role === "user") {
     return (
       <div className="flex justify-end">
@@ -129,6 +142,14 @@ function Bubble({ m }: { m: MessageRecord }) {
         </div>
         {m.error && (
           <p className="mt-1 line-clamp-3 text-xs opacity-80">{m.error}</p>
+        )}
+        {m.status === "ok" && m.code && onSaveAsFewShot && (
+          <button
+            onClick={() => onSaveAsFewShot(m)}
+            className="mt-2 rounded border border-green-700 bg-green-900/40 px-2 py-0.5 text-[11px] text-green-200 hover:bg-green-800/60"
+          >
+            👍 收藏为范例
+          </button>
         )}
         <div className="mt-1 text-[10px] opacity-60">{fmtTime(m.created_at)}</div>
       </div>

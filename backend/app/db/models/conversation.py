@@ -14,6 +14,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from ulid import ULID
 
 from app.db.models.message import Message
+from app.db.models.user import ANON_USER_ID
 from app.db.session import Base
 
 
@@ -47,8 +48,17 @@ class Conversation(Base):
         order_by="Message.created_at",
     )
 
+    user_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        default=ANON_USER_ID,
+        server_default=ANON_USER_ID,
+    )
+
     __table_args__ = (
         Index("ix_conversations_updated_at", "updated_at"),
+        Index("ix_conversations_user_id", "user_id"),
     )
 
     __all__ = ["Conversation"]

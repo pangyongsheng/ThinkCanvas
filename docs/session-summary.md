@@ -1,213 +1,120 @@
 # Session 工作总结
 
+> 最近 2 天（2026-08-06）连续 session 的改动日志。前面的内容已经过时，仅保留"项目背景 / 核心约束"作上下文。
+
 ## 项目背景
 ThinkCanvas：文字描述 → LLM 生成 Manim 代码 → 渲染成算法/数学动画视频。
-- 后端：FastAPI + langchain-openai（MiniMax OpenAI 兼容 API）
+- 后端：FastAPI + langchain-openai（MiniMax OpenAI 兼容 API + LiteLLM 适配层）
 - 前端：Next.js 15
+- 数据：Postgres + SQLAlchemy + Alembic
 
 ## 核心约束
-**MiniMax 不支持 `tool_calls`** → 不能用 `create_agent` / `bind_tools` 这类 LangChain 原生 agent 范式 → 必须手写 agent loop。
+- **MiniMax-M3 不原生支持 LangChain 1.x `create_agent` 标准写法** → 走 `langchain-litellm.ChatLiteLLM` 归一化；业务层只看到 `ChatOpenAI`
+- **MiniMax 偶发只输出 `[thinking]` 块** → 四层兜底（text-block → 字符串扫描 → 代码栅栏 + 1-shot retry）
+- **macOS 用户 TeX 不在 conda env PATH** → `app.main._augment_path_with_tex_bin` 在启动时拼进 PATH
+- **academic 风格背景色** → 必须在构造里 `self.camera.background_color = "#FFFFFF"`，改 `config.background_color` 渲染期太晚
 
 ## 本次 session 完成的工作
 
-### 1. LangChain 化 LLM 调用（替换手写实现）
-- 引入 `CodeOutput` Pydantic 模型 + `PydanticOutputParser`（替掉手写 JSON 解析）
-- 用 `ChatPromptTemplate` 模板化 prompt（替掉 `.txt` 文件 + 手动拼接）
-- 用 `StrOutputParser` 提取 content（替掉手写 RunnableLambda）
-- LCEL 用 `RunnableSequence` 构造器（不用 `|`，避免静态类型报错）
-- 简化 fallback：`code_parser.parse() → 失败 → _extract_code_from_import()`
+### 1. 基建联通 / 渲染流水线（已稳）
+- Next 15 + FastAPI + Postgres + 后端最小 hello 接通前端
+- subprocess + 60s timeout 渲染 Manim；产物落 `./media/` + `/media` 静态挂载
 
-### 2. 文件结构规范化
-原来：所有 agent 代码塞在 `coder.py`（388 行）  
-现在：
+### 2. LLM 适配层（2026-08 升级）
+- 引入 `langchain-litellm.ChatLiteLLM`，封装为 `ChatOpenAI` 类型
+- 业务层用 LangChain 1.x 标准写法：`create_agent(model=, tools=, system_prompt=, response_format=)`
+- 手写 agent loop 全部删除（9 个文件 → 4 个核心）
 
-```
-backend/app/agents/
-├── __init__.py
-├── react_coder.py        # 死代码：LangGraph ReAct agent（MiniMax 不支持 tool_calls）
-├── tools.py              # 死代码：@tool 装饰的 validate_manim_code / render_manim_dryrun
-└── coder/
-    ├── __init__.py
-    ├── parser.py   66 行  # CodeOutput + parse_with_fallback + strip_think_blocks
-    ├── chain.py    46 行  # PROMPT_TEMPLATE + build_chain (RunnableSequence)
-    ├── retry.py    89 行  # load_system_prompt + build_user_message + validate_only_retry + call_llm_once
-    ├── coder.py   154 行  # CoderAgent 类 + AgentStep + AgentResult
-    ├── sync.py     39 行  # run_sync + GenerateOutcome（一次性返回）
-    └── stream.py   45 行  # run_streaming（SSE 流式）
-```
+### 3. 多轮对话（conversations + messages 双表）
+- 表：`conversations(id, title, style, version, user_id, created_at, updated_at)` + `messages(id, conversation_id, role, content, code, video_url, scene_name, duration_sec, status, error, created_at)`
+- 路由：`POST /conversations`（建 + 首轮生成）、`POST /conversations/{id}/refine`（SSE 流式调整）、`GET /conversations`、`GET /conversations/{id}`、`DELETE /conversations/{id}`
+- `refine` prompt 三段：[历史用户指令]（最近 6 条）+ [上一版代码] + [本次用户调整要求]
+- 单次调整的 token 上界可控：assistant 历史回复一律不喂，只喂"用户说过什么"
 
-依赖方向（单向）：
-```
-coder.py / sync.py / stream.py
-  ↓ retry.py
-  ↓
-chain.py + parser.py
-  ↓
-langchain SDK
-```
+### 4. 用户系统（匿名 ULID，无登录）
+- `users(id, created_at, last_seen_at, default_style)` 表
+- 客户端：localStorage 存 ULID，每次 fetch 带 `X-User-Id` header（`frontend/lib/user.ts`）
+- 服务端：ASGI 中间件 `UserIdMiddleware` 从 header 拿用户，缺失/非法回落到 `ANON_USER_ID = "01ANON..."`
+- 所有 conversations `user_id NOT NULL`，外键到 users + ondelete CASCADE
+- 历史数据迁移：把已有 conversations 全部塞给 `ANON_USER_ID`，不丢数据
+- 路由层自动按 user_id 隔离：用户 A 看不了 / 删不了 / 调不了用户 B 的会话
 
-### 3. HTTP 层精简（generate.py）
-之前 generate.py 直接 `get_llm()` + 自己写 retry 循环  
-现在 generate.py 只做：收请求 → 调 agent 入口 → 包响应。
+### 5. Studio UI
+- 3 栏布局：左历史（可折叠默认收起）+ 中视频/代码（代码默认折叠）+ 右对话面板
+- 所有输入收敛到右侧对话面板（首次生成 + 后续调整）
+- 乐观 user message：点发送立刻显示，等 SSE 成功再刷状态
 
-`generate.py` 现在 3 个 endpoint：
-- `POST /generate`（legacy，validate-only，无渲染）—— 前端不用
-- `POST /generate/agent`（LangGraph ReAct，跑不通）—— 死代码
-- `GET /generate/stream`（**生产用**，SSE + 渲染）
+### 6. 代码规范化
+- `react_coder.py` 删 `_invoke_and_extract` 死别名（39 行，纯薄壳）
+- `refine.py` 改走 `builder.build_agent(extra_system_prompt=...)`，不再单独 `create_agent`，两个 agent 路径合一
+- `state.py` 改名 `schemas.py`（避免和 LangChain `StateGraph` 撞名）
+- 整个 `app/agents/` 目录 docstring 全部改中文
+- 单文件 ≤ 300 行（公开模块 ≤ 400 行），超出的 helper 拆出去
+- 编码规范见 `docs/coding-guidelines.md`
 
-### 4. 测试
-`backend/tests/agents/test_coder.py` 4/4 通过：
-- `test_agent_returns_code_on_first_try`
-- `test_agent_retries_when_render_fails`
-- `test_agent_returns_none_when_validation_keeps_failing`
-- `test_agent_handles_llm_call_failure`
-
-测试 helper 改用真 `AIMessage`（之前用 MagicMock，跟 `StrOutputParser` 不兼容）。
-
-### 5. Docstring 全部中文
-6 个 agent 文件的 docstring 都改成中文。
-
-## 当前状态
-
-### 项目能跑的部分
-- ✅ `langchain-openai` + MiniMax OpenAI 兼容 API 接通
-- ✅ 调 LLM 出 Manim 代码（结构化 JSON 输出 + Pydantic 解析）
-- ✅ 校验重试（`validate_only_retry`）
-- ✅ Manim 渲染（subprocess + 60s timeout）
-- ✅ SSE 流式推送进度
-- ✅ 4/4 测试通过
-
-### 项目没跑通的部分（已知）
-- ❌ `react_coder.py` 的 LangGraph ReAct agent——MiniMax 不支持 tool_calls
-- ❌ `bind_tools` / `create_agent` 直接用 MiniMax——同上
-- ❌ LiteLLM proxy 方案——**本次 session 试图引入但安装链太长放弃**
-
-## 关键技术决策（交接必读）
-
-### 1. 为什么不用 `create_agent` / `bind_tools`
-MiniMax 不支持 OpenAI 风格的 `tool_calls`。  
-验证过：
-- `langchain_community.chat_models.MiniMaxChat` 存在但包被废弃
-- 没有 `langchain-minimax` 官方包
-- LiteLLM proxy 起不来（缺太多依赖：boto3 / prisma / pyjwt 等 10+ 个）
-
-**结论**：维持手写 agent loop。用 LangChain 的零件（parser / LCEL）但不用 agent 大脑。
-
-### 2. chain 用 `RunnableSequence` 构造器，不用 `|`
-LangChain 的 `|` 类型签名静态分析推断不通。  
-用 `RunnableSequence(first=..., middle=[...], last=...)` 显式构造，类型干净。
-
-### 3. 测试用 `AIMessage`，不用 MagicMock
-`StrOutputParser.parse()` 内部用 `Generation(text=...)` Pydantic 校验，会拒绝 MagicMock。  
-测试 helper 必须返 `AIMessage`。
-
-### 4. agent loop 的 try/except 包 chain.ainvoke
-网络错误就跳过这一步 + 记 `LLM call failed`。  
-没用 `chain.with_retry()`，因为我们的 retry 是给校验失败用的，不是网络错误。
-
-## 下一步建议（待接手）
-
-按优先级：
-
-1. **重跑 e2e**：手动从前端触发一次生成，确认 SSE + 渲染链路通
-2. **补 few-shot**：v1.0 要求 3 个算法，目前只有 1 个（冒泡排序）。补 二分查找 + 图 BFS
-3. **清理死代码**：考虑删 `react_coder.py` + `tools.py` + `/generate` + `/generate/agent`
-4. **持久化**：Step 5（user 表 + history 表 + 中英切换）
-5. **端到端压测**：Step 6（3 算法 × 10 次）
-
-## 已知风险
-
-- MiniMax 不稳定：复杂 prompt（few-shot 长了）可能超时
-- `manim_timeout=60s`：复杂动画可能不够
-- LaTeX 没装：`MathTex` 会报错，但 prompt 已经禁用
-
-## 相关文档
-
-- `docs/mvp-scope.md`：项目范围 + 6 步开发步骤
-- `docs/product.md`：产品定位
-- `docs/tech-stack.md`：技术栈选型
-- `shared/prompts/system/v1.txt`：当前 prompt（只有冒泡排序 1 个 few-shot）
----
-
-## Session #2: LiteLLM 适配层 + 标准 LangChain 1.x 重构（2026-08-06）
-
-### 背景
-Session #1 留的现状是手写 agent loop + LangChain 零件。问题：
-1. MiniMax 不支持 OpenAI 标准 `tool_calls`，被迫手写解析循环
-2. JSON 输出走 `PydanticOutputParser` + 手写 fallback regex
-3. `<think>` 块要手写正则剥
-4. Agent 文件 6 个，加 react_coder.py 一共 7 个，~530 行手写样板
-
-### 目标
-业务代码全部用 LangChain 1.x 标准写法（`create_agent` / `with_structured_output` / `ChatOpenAI`），靠 LiteLLM 抹平 MiniMax 协议差异。
-
-### 关键决策
-**A. 模型层用 `langchain_litellm.ChatLiteLLM`，对外暴露为 `ChatOpenAI` 类型**
-
-理由：
-- 业务代码 100% 标准 LangChain 写法（`from langchain_openai import ChatOpenAI`）
-- LiteLLM 内嵌调用（不启 proxy 服务），守住开局约束
-- 运行时是 `ChatLiteLLM` 实例，静态类型注解是 `ChatOpenAI`，用 `cast()` 桥接
-- 切换厂商（DeepSeek / OpenAI 原生）只改 `client.py` 一个文件
-
-**B. 结构化输出用 `create_agent(..., response_format=CodeOutput)`**
-
-不是 `llm.with_structured_output(CodeOutput)` —— 因为后者返回 `RunnableSequence`，不是 `BaseChatModel`，`create_agent.model=` 参数不接受。LangChain 1.x 标准做法是 `model` + `response_format` 分开传。
-
-**C. 删除所有手写循环、解析、chain 装配**
-
-- `coder/parser.py` —— 删除（被 Pydantic 自动校验取代）
-- `coder/chain.py` —— 删除（LCEL 装配被 `create_agent` 内置取代）
-- `coder/coder.py` —— 删除 `CoderAgent` 手写循环
-- `coder/retry.py` —— 删除 `validate_only_retry`（agent 内置工具循环）
-- `coder/sync.py` —— 删除（重写 `run_agent` 一处）
-- `coder/stream.py` —— 删除（SSE 在 HTTP 层重写）
-
-### 最终结构
+### 7. 文件 / 模块树（截至本次 session 末尾）
 
 ```
 backend/app/
-├── llm/
-│   └── client.py          # 唯一出现 ChatLiteLLM；cast(ChatOpenAI, litellm_chat)
+├── main.py
+├── config.py
+├── middleware/
+│   └── user_id.py                # X-User-Id 解析
 ├── agents/
-│   ├── state.py           # Pydantic CodeOutput（response_format schema）
-│   ├── tools.py           # @tool 装饰的工具函数
-│   ├── builder.py         # create_agent(model=, tools=, system_prompt=, response_format=)
-│   └── react_coder.py     # run_agent 入口 + 日志
-├── core/
-│   └── logging.py         # structlog + 全局异常中间件（可观测性）
-├── api/v1/generate.py     # 3 个端点（/generate、/generate/agent、/generate/stream）
-└── main.py                # load_dotenv + configure_logging + FastAPI 工厂
+│   ├── react_coder.py            # 单次生成 wrapper（薄壳）
+│   ├── refine.py                 # 多轮调整 wrapper（拼 user history）
+│   ├── builder.py                # create_agent 工厂 + @lru_cache
+│   ├── schemas.py                # CodeOutput Pydantic schema
+│   ├── styles.py                 # 风格注册表（3b1b / minimal / academic）
+│   ├── tools.py                  # @tool validate / render
+│   └── agent_recovery.py         # 四层兜底 + 1-shot retry
+├── api/v1/
+│   ├── generate.py               # /generate (legacy) + /generate/stream (主用)
+│   ├── conversations.py          # /conversations + /refine SSE
+│   ├── tasks.py                  # 老 task CRUD（v2 移除）
+│   ├── render.py
+│   ├── health.py
+│   └── readyz.py
+├── storage/
+│   ├── conversations.py
+│   ├── tasks.py
+│   └── users.py
+├── renderers/manim.py
+├── tools/validator.py
+├── llm/client.py
+└── db/
+    ├── session.py
+    └── models/
+        ├── user.py
+        ├── conversation.py
+        ├── message.py
+        └── task.py
+
+frontend/
+├── app/page.tsx
+├── components/
+│   ├── HistorySidebar.tsx
+│   ├── CodeViewer.tsx
+│   └── ConversationPanel.tsx
+└── lib/
+    ├── api.ts                    # fetchJson 默认加 X-User-Id
+    └── user.ts                   # ULID 生成 + localStorage
 ```
 
-### 验证结果
+### 8. 测试
+- pytest：**61 passed**
+  - 38 → 40（agent_recovery / refine 单元测试）
+  - + 5（user history cap）
+  - + 11（user_id middleware）
+  - + 5（user-scoped conversation 行为）
+- tsc：`./node_modules/.bin/tsc --noEmit` 无错
 
-| 检查 | 结果 |
-|---|---|
-| `pytest tests/agents/test_coder.py` | **6/6 通过** |
-| 静态扫描：业务层 0 个 `ChatLiteLLM` 引用 | ✅ |
-| 静态扫描：可执行代码 0 个 `ChatOpenAI` / `MiniMaxChat` / `langchain_community` / `strip_think_blocks` | ✅ |
-| `get_llm()` 静态类型注解 = `ChatOpenAI` | ✅ |
-| `get_llm()` 运行时类型 = `ChatLiteLLM` | ✅ |
-| `create_agent(...)` 产出 `CompiledStateGraph` | ✅ |
-| 前端实测（"画一个旋转的正方形"）出 mp4 | ✅ |
+## 已知 TODO（下一步）
 
-### 踩坑记录
-
-1. **`langchain-litellm` 装包卡死**（0.7.0 之前版本）→ 用 `--no-deps` + 手动补依赖绕开
-2. **`timeout` / `max_tokens` kwargs 在 `ChatLiteLLM.__init__` 看不到**（`*args, **kwargs` 签名）→ 归到 `model_kwargs` 字典透传
-3. **`create_agent(model=...)` 不接受 Runnable** → 只传 chat model，结构化走 `response_format`
-4. **`ainvoke(config=...)` 类型签名要 `RunnableConfig`** → 用 `cast(RunnableConfig, ...)` 标注
-
-### 当前状态（v1.0 已跑通）
-
-- ✅ 端到端：前端输入 → 后端 `create_agent` → MiniMax 生成代码 → 工具验证 + 渲染 → SSE 推 mp4
-- ⚠️ 偶发失败：LiteLLM + MiniMax 自身稳定性问题（Connection error / 模型未收敛），需要补 tenacity 重试
-
-### 下一步建议
-
-1. **LiteLLM 重试层**：`tenacity` 包 `acompletion`，网络错自动重试 2 次
-2. **补 few-shot**：v1.0 要 3 个算法（冒泡排序已有），补 二分查找 + 图 BFS
-3. **Step 5 持久化**：user/history 表 + 历史查询 API + 前端列表
-4. **Step 6 压测**：3 算法 × 10 次，统计成功率 + P95 延迟
-
+| 项 | 说明 | 优先级 |
+|---|---|---|
+| **few-shot 库（SQL 检索版）** | 把 `shared/prompts/styles/*.md` 里硬编码的 few-shot 抽到 `few_shots` 表；按 prompt 关键词选 1-2 个拼进 system prompt | 高 |
+| **持久化记忆** | `user_preferences`（语言 / 默认风格）+ `user_algorithm_history`（user × 算法 × 时间）；创建会话时塞进 system prompt | 中 |
+| **端到端压测** | 3 算法 × 10 次成功率 / 时长（Step 6） | 中 |
+| **Worker 异步化** | `rq.enqueue` 解 API 阻塞 | 低（v1.x） |
+| **OSS / S3** | 视频存储 | 低 |

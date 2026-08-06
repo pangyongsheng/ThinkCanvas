@@ -1,13 +1,13 @@
-"""LangChain tools the ReAct agent can call.
+"""ReAct agent 可调用的 LangChain tools。
 
-Each function is decorated with ``@tool``; LangChain parses the docstring +
-parameter types into a JSON schema the LLM can choose to call.
+每个函数用 ``@tool`` 装饰；LangChain 会把 docstring + 参数类型解析成 LLM
+可以选择的 JSON schema。
 
-The agent flow becomes:
-    1. LLM generates code
-    2. LLM calls ``validate_manim_code(code)`` -> "OK" or "errors: ..."
-    3. LLM calls ``render_manim_dryrun(code)`` -> "rendered ok: path" or stderr
-    4. LLM decides what to do next (fix, retry, or stop)
+agent 流程：
+    1. LLM 生成代码
+    2. LLM 调用 ``validate_manim_code(code)`` -> ``OK`` 或 ``errors: ...``
+    3. LLM 调用 ``render_manim_dryrun(code)`` -> ``rendered ok: <路径>`` 或 stderr
+    4. LLM 决定下一步（修复、重试或结束）
 """
 from __future__ import annotations
 

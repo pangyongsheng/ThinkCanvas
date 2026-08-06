@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +32,7 @@ from app.db.models import Conversation, Message
 from app.db.session import async_session_factory, get_session
 from app.renderers.manim import render_code
 from app.storage import conversations as conv_store
+from app.storage import users as user_store
 from app.tools.validator import extract_scene_name
 
 
@@ -88,6 +89,21 @@ class CreateConversationOut(BaseModel):
 
 
 # ---------- Helpers ----------
+
+
+
+
+async def _resolve_user_id(request: Request, session: AsyncSession) -> str:
+    """Read the user_id stamped on ``request.state`` and ensure a row exists.
+
+    Side-effect: ensures a User row exists (upsert). Conversations and
+    their FK reference the User table, so we can't create them against
+    a ULID we haven't seen before.
+    """
+    user_id: str = request.state.user_id
+    await user_store.upsert_user(session, user_id)
+    return user_id
+
 
 @asynccontextmanager
 async def _open_session() -> AsyncIterator[AsyncSession]:
@@ -179,6 +195,7 @@ async def _render_initial(
 @router.post("/conversations", response_model=CreateConversationOut)
 async def create_conversation(
     req: CreateConversationReq,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> CreateConversationOut:
     """Create a conversation + first user message + first render in one shot."""
@@ -186,7 +203,10 @@ async def create_conversation(
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is empty")
 
-    conv = await conv_store.create_conversation(session, prompt=prompt, style=req.style)
+    user_id = await _resolve_user_id(request, session)
+    conv = await conv_store.create_conversation(
+        session, prompt=prompt, style=req.style, user_id=user_id,
+    )
     code, video_url, scene_name, duration_sec, assistant_msg = await _render_initial(
         session,
         conversation_id=conv.id,
@@ -216,20 +236,28 @@ async def create_conversation(
 
 @router.get("/conversations", response_model=list[ConversationOut])
 async def list_conversations(
+    request: Request,
     limit: int = 50,
     offset: int = 0,
     session: AsyncSession = Depends(get_session),
 ) -> list[ConversationOut]:
-    rows = await conv_store.list_conversations(session, limit=limit, offset=offset)
+    user_id = await _resolve_user_id(request, session)
+    rows = await conv_store.list_conversations(
+        session, limit=limit, offset=offset, user_id=user_id,
+    )
     return [_conv_to_out(c) for c in rows]
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetailOut)
 async def get_conversation(
+    request: Request,
     conversation_id: str,
     session: AsyncSession = Depends(get_session),
 ) -> ConversationDetailOut:
-    conv = await conv_store.get_conversation(session, conversation_id)
+    user_id = await _resolve_user_id(request, session)
+    conv = await conv_store.get_conversation(
+        session, conversation_id, user_id=user_id,
+    )
     if conv is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     return ConversationDetailOut(
@@ -240,10 +268,14 @@ async def get_conversation(
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
 async def delete_conversation(
+    request: Request,
     conversation_id: str,
     session: AsyncSession = Depends(get_session),
 ):
-    ok = await conv_store.delete_conversation(session, conversation_id)
+    user_id = await _resolve_user_id(request, session)
+    ok = await conv_store.delete_conversation(
+        session, conversation_id, user_id=user_id,
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="conversation not found")
     return None
@@ -251,6 +283,7 @@ async def delete_conversation(
 
 @router.post("/conversations/{conversation_id}/refine")
 async def refine_conversation(
+    request: Request,
     conversation_id: str,
     req: RefineReq,
     session: AsyncSession = Depends(get_session),
@@ -260,7 +293,10 @@ async def refine_conversation(
     if not instruction:
         raise HTTPException(status_code=400, detail="instruction is empty")
 
-    conv = await conv_store.get_conversation(session, conversation_id)
+    user_id = await _resolve_user_id(request, session)
+    conv = await conv_store.get_conversation(
+        session, conversation_id, user_id=user_id,
+    )
     if conv is None:
         raise HTTPException(status_code=404, detail="conversation not found")
 
@@ -281,6 +317,11 @@ async def refine_conversation(
             detail="no previous code in conversation — generate first",
         )
 
+    # Snapshot user history BEFORE appending the current turn, so the
+    # LLM only sees prior rounds in the "history" block — the current
+    # instruction is highlighted separately as "本次用户调整要求".
+    user_history = await conv_store.list_user_messages(session, conversation_id)
+
     user_msg = await conv_store.append_user_message(session, conversation_id, instruction)
     user_msg_id = user_msg.id
 
@@ -292,7 +333,13 @@ async def refine_conversation(
             yield _sse("started", {"conversation_id": conversation_id, "user_message_id": user_msg_id})
             yield _sse("generating", {"instruction": instruction})
 
-            result = await run_refine(latest_code, instruction, style_id=style, max_iterations=6)
+            result = await run_refine(
+                latest_code,
+                instruction,
+                style_id=style,
+                max_iterations=6,
+                user_history=user_history,
+            )
             code = result.get("code")
             tool_calls = len(result.get("tool_log", []))
 

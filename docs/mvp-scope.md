@@ -21,12 +21,50 @@
 4. **Web UI 最小版** —— 输入 / 进度（百分比 + 节点）/ 视频 / 代码 / 重渲染
    - 完成标志：Web 端到端跑通
    - **状态**：✅ 基本版。输入 / Generate 按钮 / 进度条 / 视频 / 代码框 / 重渲染 / SSE 实时进度。全跑通。
-5. **持久化 + 多语言 + 可观测** —— user / history 表 + 中英切换 + LangSmith 接入
-   - 完成标志：刷新页面历史还在；UI 切语言立刻反应
-   - **状态**：❌ 没动。
+5. **持久化 + 用户系统** —— users 表 + 匿名 ULID 身份 + conversations 隔离；偏好 / 历史召回留 v1.1
+   - 完成标志：刷新页面历史还在；不同 ULID 看不到对方会话
+   - **状态**：✅ 基本完成（2026-08）。users 表 + X-User-Id 中间件 + 前端 ULID；中英切换留待 v1.1。
+
 6. **端到端验证** —— 3 个算法各跑 10 次，记录成功率 / 时长 / 修整
    - 完成标志：数据说话、可继续推进 v1.x
    - **状态**：❌ 没动。
+
+## 🆕 v1.1 增量（2026-08-06 起）
+
+> v1.0 的 6 步基线已大部分跑通。v1.1 在它上面加深度，不是新立项目。
+
+### v1.1.1 · 多轮对话（已上线）
+- Conversations + Messages 双表
+- refine prompt 三段：[历史用户指令]（最近 6 条 user 原话）+ [上一版完整代码] + [本次用户调整要求]
+- 助手的旧回复**不喂**（省 token、且历史 user 原话足够表达渐进式需求）
+- UI 全部收敛到右侧对话面板（首次生成 + 续轮调整）
+
+### v1.1.2 · 用户系统（已上线）
+- 匿名 ULID：前端 `localStorage` 存 26 位 Crockford 字符串，发请求带 `X-User-Id` header
+- 服务端 `UserIdMiddleware`：合法则用，缺失/非法回落 `ANON_USER_ID`
+- 所有 conversations 强制 `user_id NOT NULL`（外键到 users，ondelete CASCADE）
+- 历史数据迁移：把已有 conversations 全塞给 `ANON_USER_ID`，不丢数据
+- 不做：账号、密码、登录、token、多设备同步
+
+### v1.1.3 · 编码规范化（已上线）
+- 单文件 ≤ 300 行（公开 helper 模块 ≤ 400 行），超出拆 helper
+- 整个 `app/agents/` docstring 改中文
+- `state.py` → `schemas.py`（避免和 LangChain `StateGraph` 撞名）
+- `react_coder.py` 删死别名；`refine.py` 改走 `build_agent(extra_system_prompt=...)` —— 两个 agent 路径合一
+- 完整规范见 `docs/coding-guidelines.md`
+
+### v1.1.4 · 持久化记忆（TODO，明天）
+- `user_preferences(default_style, language)` 表
+- `user_algorithm_history(user_id, algorithm, last_used_at)` 表
+- 创建会话时按 user 偏好 / 过去用过的算法塞 system prompt 头部
+
+### v1.1.5 · Few-shot 检索（TODO，明天）
+- 把 `shared/prompts/styles/*.md` 里硬编码的 few-shot 抽到 `few_shots` 表
+- 按 prompt 关键词粗筛 1-2 个拼进 system prompt
+- 目标：抬升一次成功率
+
+### v1.1.6 · 端到端压测（TODO）
+- 3 算法 × 10 次，记录成功率 / 时长 / 修整
 
 ---
 
@@ -36,7 +74,9 @@
 |---|---|---|
 | **LiteLLM 适配层** | `app/llm/client.py::ChatLiteLLM` 封装为 `ChatOpenAI` | ✅ 业务只见 `ChatOpenAI` |
 | **结构化输出**（`CodeOutput` Pydantic schema） | `app/agents/state.py::CodeOutput` + `create_agent(response_format=...)` | ✅ 6 test 通过 |
-| **标准 LangChain 1.x `create_agent`** | `app/agents/builder.py` 调用 `langchain.agents.create_agent` | ✅ 单例，lru_cache |
+| **标准 LangChain 1.x `create_agent`** | `app/agents/builder.py` 调用 `langchain.agents.create_agent` | ✅ 单例，lru_cache(style_id, extra_prompt) |
+| **四层兜底**（thinking / 字符串扫描 / 代码栅栏 + 1-shot retry） | `app/agents/agent_recovery.py::invoke_with_recovery` | ✅ MiniMax-M3 频繁只输出 thinking |
+| **多轮对话 prompt 拼装** | `app/agents/refine.py::_build_refine_prompt` | ✅ 历史用户指令 cap 6 条 |
 | **`@tool` 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ✅ agent 直接调用 |
 | **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `run_agent()`；agent 在 `app/agents/builder.py` | ✅ |
 | **可观测性** | `app/core/logging.py` + `run_agent` 进出日志 + FastAPI 全局异常中间件 | ✅ |
@@ -54,54 +94,75 @@
 ## 🗂 关键文件清单（接手请扫这些）
 
 ```
-backend/
-├── app/
-│   ├── agents/
-│   │   ├── coder/                       # ✅ 实际在用
-│   │   │   ├── coder.py                 # CoderAgent 类
-│   │   │   ├── retry.py                 # validate_only_retry + call_llm_once
-│   │   │   ├── chain.py                 # RunnableSequence 构造
-│   │   │   ├── parser.py                # CodeOutput + parse_with_fallback
-│   │   │   ├── sync.py                  # run_sync
-│   │   │   └── stream.py                # run_streaming（SSE）
-│   │   ├── react_coder.py               # ⚠️ 死代码：LangGraph ReAct（MiniMax 不支持 tool_calls）
-│   │   └── tools.py                     # ⚠️ 死代码：@tool 装饰
-│   ├── api/v1/
-│   │   ├── generate.py                  # /generate (legacy), /generate/stream (生产), /generate/agent (死)
-│   │   ├── render.py                    # /render
-│   │   ├── health.py
-│   │   └── readyz.py
-│   ├── renderers/manim.py               # subprocess + 60s 超时
-│   ├── tools/validator.py               # AST + 危险模式 + Scene 子类检查
-│   ├── llm/client.py                    # ChatOpenAI 配 MiniMax base_url
-│   ├── config.py                        # 读项目根 .env，model_name = "MiniMax-M3"
-│   └── main.py
-├── tests/agents/
-│   └── test_coder.py                    # 4/4 测试通过
-├── pyproject.toml
-└── .env.example
+backend/app/
+├── main.py                              # FastAPI 入口；挂 UserIdMiddleware + CORS
+├── config.py                            # 读项目根 .env
+├── middleware/user_id.py                # X-User-Id 解析（case-insensitive ULID 正则）
+├── agents/
+│   ├── react_coder.py                   # run_agent 薄壳（39 行）
+│   ├── refine.py                        # run_refine（拼 user history）
+│   ├── builder.py                       # create_agent 工厂 + lru_cache(style_id, extra_prompt)
+│   ├── schemas.py                       # CodeOutput Pydantic schema
+│   ├── styles.py                        # 3 风格注册（academic / 3b1b / minimal）
+│   ├── tools.py                         # @tool validate_manim_code / render_manim_dryrun
+│   └── agent_recovery.py                # 四层兜底（thinking / aggressive / fence + retry）
+├── api/v1/
+│   ├── generate.py                      # /generate (legacy) + /generate/stream (主用)
+│   ├── conversations.py                 # /conversations + /refine SSE；5 个端点都按 user_id 隔离
+│   ├── tasks.py                         # 老 task CRUD（v2 移除）
+│   ├── render.py
+│   ├── health.py
+│   └── readyz.py
+├── storage/
+│   ├── conversations.py                 # CRUD + sync helpers（测试用）
+│   ├── users.py                         # upsert_user / touch_last_seen
+│   └── tasks.py
+├── renderers/manim.py                   # subprocess + 60s 超时
+├── tools/validator.py                   # AST + 危险模式 + Scene 子类检查
+├── llm/client.py                        # ChatLiteLLM 封装为 ChatOpenAI
+└── db/
+    ├── session.py
+    └── models/
+        ├── user.py
+        ├── conversation.py              # 含 user_id FK
+        ├── message.py
+        └── task.py
 
-shared/prompts/system/v1.txt             # System prompt（嵌 1 个冒泡排序 few-shot）
-shared/prompts/examples/                 # ⚠️ 空目录；后续 few-shot 库位置
+backend/alembic/versions/
+├── 20260806_add_conversations_and_messages.py
+└── 20260806_add_users_and_user_id.py    # users + conv.user_id + anon backfill
+
+backend/tests/                            # 61 passed
+├── conftest.py
+├── agents/                               # agent_recovery / refine / coder
+├── storage/                              # user history cap + user scope
+└── middleware/                           # user_id 中间件
+
+shared/prompts/styles/                    # base.md + 3b1b / minimal / academic
 
 frontend/
-├── app/page.tsx                         # EventSource 订阅 + 进度条 + 视频 + 代码框
-├── lib/api.ts                           # generateCode / renderManim / subscribeGenerate
-└── ...
+├── app/page.tsx                          # 3 栏布局 + 乐观 user message
+├── components/
+│   ├── HistorySidebar.tsx                # 可折叠侧栏（默认 48px）
+│   ├── CodeViewer.tsx                    # 视频 / 代码 tab（代码默认折叠）
+│   └── ConversationPanel.tsx             # 对话气泡 + 输入框
+└── lib/
+    ├── api.ts                            # fetchJson 默认加 X-User-Id
+    └── user.ts                           # ULID 生成 + localStorage 持久化
 
-docker/docker-compose.yml                # postgres + redis 已起（redis 未接业务）
+docker/docker-compose.yml                 # postgres + redis（redis 未接业务）
 ```
 
 ---
 
-## 🔑 下一步建议（接手者）
+## 🔑 下一步建议（接手者，按优先级）
 
-1. **最高优先**：Worker 异步化（`backend/app/workers/` 写渲染任务 + `rq.enqueue` 改造 API）
-2. **其次**：补完 few-shot 库（二分查找、图 BFS 遍历，存 `shared/prompts/examples/`）
-3. **再然后**：清理死代码（`react_coder.py` / `tools.py` / `POST /generate` / `POST /generate/agent`）
-4. **Step 5**：持久化（user / history 表 + alembic 迁移 + 中英切换）
-5. **Step 6**：端到端 3 算法 × 10 次跑（数据说话）
-6. **远期**：等加多 Agent 编排时（v2.0），评估是否升级到 `langgraph.StateGraph`；当前 `create_agent` 单 agent 已够
+1. **持久化记忆**（`user_preferences` + `user_algorithm_history`，明天）：创建会话时按偏好 / 过去算法塞 system prompt 头部
+2. **Few-shot 检索**（明天）：把 `shared/prompts/styles/*.md` 里硬编码的 few-shot 抽到 `few_shots` 表，按 prompt 关键词粗筛 1-2 个拼进 system prompt
+3. **Step 6 端到端压测**：3 算法 × 10 次成功率 / 时长
+4. **Worker 异步化**（v1.x）：`rq.enqueue` 解 API 阻塞
+5. **死代码清理**：`/generate` legacy + `/generate/agent` 死端点（前端未用，等前端切完删）
+6. **远期**：等加多 Agent 编排（v2.0）时评估 `langgraph.StateGraph`；当前 `create_agent` 单 agent 已够
 
 ---
 

@@ -167,6 +167,17 @@ docker/docker-compose.yml             # postgres + redis（redis 未接业务）
 - **理由**：MiniMax 协议归一化交给 LiteLLM；业务层 100% 标准 LangChain 写法；换厂商只改 `client.py`
 - **迁移路径**：未来换原生支持 tool_calls 的 LLM（GPT-4o 等），`client.py` 一行 import 切换即可
 
+### ADR-006 · 匿名 ULID 用户（2026-08 上线）
+- **决策**：身份 = 客户端 26 位 Crockford ULID，存在 `localStorage`，请求带 `X-User-Id` header；服务端中间件校验，缺失/非法回落 `ANON_USER_ID`
+- **理由**：用户明确要求最简方案，不要登录 / 验证 / 邮箱
+- **代价**：浏览器清缓存 = 失忆；不同浏览器 / 设备看到的历史互相看不到
+- **未来**：如果要登录系统，把 `User` model 扩展为可选 `email` 字段、`users.id` 仍可为 ULID，新增 `auth_tokens` 表做 session 即可
+
+### ADR-007 · 双 agent 路径合一（2026-08 重构）
+- **决策**：`run_agent`（单次）和 `run_refine`（多轮）都走 `builder.build_agent(style_id, extra_system_prompt=...)`；按 `(style_id, extra_prompt)` 维度 lru_cache
+- **理由**：以前 `refine` 自己调 `create_agent`，等于"两条工厂路径"，以后加 tool / 改 schema 要改两处
+- **代价**：`extra_system_prompt` 不同会破坏 cache 复用，但 refine 调用不频繁，可忽略
+
 ## 🚨 安全考虑
 
 | 风险 | 缓解 | 状态 |
@@ -191,8 +202,9 @@ docker/docker-compose.yml             # postgres + redis（redis 未接业务）
 | 项 | 说明 | 优先级 |
 |---|---|---|
 | **Worker 异步化** | `backend/app/workers/` 写渲染任务 + `rq.enqueue` 改 API | 高（解决 API 阻塞） |
-| **持久化** | Step 5 — user / history 表 + alembic 迁移 + 中英切换 | 高 |
-| **few-shot 库** | v1.0 要求 3 个算法，目前 system prompt 里只塞了冒泡排序 | 高 |
+| **持久化** | ✅ Step 5 — users + conversations.user_id 完成（2026-08）；中英切换留 v1.1 | 高 |
+| **持久化记忆** | v1.1 — `user_preferences` + `user_algorithm_history`；按偏好 / 过去算法塞 prompt | 高 |
+| **few-shot 检索** | v1.1 — 把硬编码 few-shot 抽到 `few_shots` 表，按 prompt 关键词粗筛 1-2 个 | 高 |
 | **Docker 沙箱** | v0.2 计划 | 中 |
 | **LangGraph 状态机** | 备选方案；当前 `create_agent` 已足够，未来加多 Agent 编排时再评估 | 低 |
 | **LangSmith / LangFuse** | 可观测 | 中 |

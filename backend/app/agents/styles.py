@@ -1,12 +1,12 @@
-"""Style registry — maps style_id to a system-prompt description.
+"""风格注册表 — style_id → 系统 prompt 描述的映射。
 
-A style is just a markdown file with:
-  - visual guidelines (colors / sizes / rhythm)
-  - one few-shot code example
+一个风格就是一个 markdown 文件，包含：
+  * 视觉指南（配色 / 尺寸 / 节奏）
+  * 一段 few-shot 代码示例
 
-The agent receives the chosen style's markdown appended to the base
-system prompt. We don't hard-code styles in Python — adding a new style
-is a matter of dropping a new .md file in ``shared/prompts/styles/``.
+agent 收到的系统 prompt 是 base 文件 + 选中风格文件拼接而成。
+我们不在 Python 里硬编码风格 — 新增一个风格只是在
+``shared/prompts/styles/`` 目录里丢一个 .md 文件。
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ _STYLES_DIR = (
 )
 _BASE_FILE = _STYLES_DIR / "base.md"
 
-# Canonical list — keep in sync with frontend dropdown.
+# 规范列表 — 与前端下拉框保持同步。
 STYLE_IDS: tuple[str, ...] = ("3b1b", "minimal", "academic")
 DEFAULT_STYLE_ID = "3b1b"
 
@@ -30,10 +30,10 @@ DEFAULT_STYLE_ID = "3b1b"
 class Style:
     id: str
     name: str
-    description: str  # full markdown body (base + style-specific)
+    description: str  # 完整的 markdown 内容（base + 风格特化）
 
 
-# Friendly labels (used by frontend).
+# 友好显示名（前端用）。
 STYLE_LABELS: dict[str, str] = {
     "3b1b": "3Blue1Brown（深色鲜艳）",
     "minimal": "Minimal（深色极简）",
@@ -42,10 +42,9 @@ STYLE_LABELS: dict[str, str] = {
 
 
 def load_style(style_id: str) -> Style:
-    """Load a style by id; unknown ids fall back to ``DEFAULT_STYLE_ID``.
+    """按 id 加载风格；未知 id 回退到 ``DEFAULT_STYLE_ID``。
 
-    Raises FileNotFoundError only if the base file is missing — a
-    programming error, not a user error.
+    只有 base 文件缺失才会抛 FileNotFoundError — 这是编程错误而不是用户错误。
     """
     if not _BASE_FILE.exists():
         raise FileNotFoundError(f"base style file missing: {_BASE_FILE}")
@@ -55,7 +54,7 @@ def load_style(style_id: str) -> Style:
 
     style_file = _STYLES_DIR / f"{style_id}.md"
     if not style_file.exists():
-        # Style file missing for an *allowed* id — also fall back.
+        # 允许的 id 但文件缺失 — 也回退。
         style_id = DEFAULT_STYLE_ID
         style_file = _STYLES_DIR / f"{style_id}.md"
 

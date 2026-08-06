@@ -6,6 +6,8 @@ from pathlib import Path as _Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from app.middleware.user_id import UserIdMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.generate import router as generate_router
@@ -14,6 +16,7 @@ from app.api.v1.readyz import router as readyz_router
 from app.api.v1.render import router as render_router
 from app.api.v1.tasks import router as tasks_router
 from app.api.v1.conversations import router as conversations_router
+from app.api.v1.few_shots import router as few_shots_router
 from app.config import get_settings, project_root
 from app.core.logging import configure_logging, install_fastapi_exception_logger
 
@@ -64,6 +67,12 @@ def create_app() -> FastAPI:
 
     # CORS — frontend at :3000 talks to backend at :8000
     cors_list = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+    # Stamp request.state.user_id from the X-User-Id header.
+    # Goes AFTER CORS so OPTIONS preflights (which carry no body) still
+    # get a CORS response, but the middleware itself is cheap so order
+    # doesn't matter functionally.
+    app.add_middleware(UserIdMiddleware)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_list,
@@ -79,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(render_router, prefix=settings.api_v1_prefix)
     app.include_router(tasks_router, prefix=settings.api_v1_prefix)
     app.include_router(conversations_router, prefix=settings.api_v1_prefix)
+    app.include_router(few_shots_router, prefix=settings.api_v1_prefix)
 
     # Static: serve generated videos
     media_dir = project_root / "media"

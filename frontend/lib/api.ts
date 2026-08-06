@@ -1,3 +1,5 @@
+import { getOrCreateUserId } from "./user";
+
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
@@ -34,7 +36,11 @@ export interface TaskRecord {
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BACKEND_URL}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      "X-User-Id": getOrCreateUserId(),
+      ...(init?.headers ?? {}),
+    },
     cache: "no-store",
   });
   const text = await res.text();
@@ -242,6 +248,44 @@ export async function deleteConversation(id: string): Promise<{ deleted: string 
   return fetchJson<{ deleted: string }>(`/api/v1/conversations/${id}`, {
     method: "DELETE",
   });
+}
+
+// ---------- Few-shot library ----------
+
+export interface FewShotRecord {
+  id: string;
+  prompt: string;
+  code: string;
+  summary: string;
+  style: string;
+  source_conversation_id: string | null;
+  source_message_id: string | null;
+  created_at: string;
+}
+
+export interface SaveFewShotInput {
+  prompt: string;
+  code: string;
+  style: string;
+  source_conversation_id?: string;
+  source_message_id?: string;
+}
+
+export async function saveAsFewShot(input: SaveFewShotInput): Promise<FewShotRecord> {
+  return fetchJson<FewShotRecord>("/api/v1/few_shots", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function listFewShots(
+  style?: string,
+  limit = 50,
+): Promise<FewShotRecord[]> {
+  const params = new URLSearchParams();
+  if (style) params.set("style", style);
+  params.set("limit", String(limit));
+  return fetchJson<FewShotRecord[]>(`/api/v1/few_shots?${params}`);
 }
 
 export interface RefineStreamHandlers {

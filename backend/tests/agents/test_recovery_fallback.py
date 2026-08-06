@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 
-from app.agents.state import CodeOutput
+from app.agents.schemas import CodeOutput
 
 
 RUNNABLE_CODE = (

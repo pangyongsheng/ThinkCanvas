@@ -2,5 +2,7 @@
 from app.db.models.task import Task
 from app.db.models.conversation import Conversation
 from app.db.models.message import Message
+from app.db.models.user import User, ANON_USER_ID
+from app.db.models.few_shot import FewShot
 
-__all__ = ["Task", "Conversation", "Message"]
+__all__ = ["Task", "Conversation", "Message", "User", "ANON_USER_ID", "FewShot"]

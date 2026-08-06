@@ -9,6 +9,7 @@ import {
   StyleId,
   createConversation,
   getConversation,
+  saveAsFewShot,
   subscribeRefine,
 } from "@/lib/api";
 
@@ -90,6 +91,25 @@ export default function Page() {
     // Subsequent turns run through refine.
     await handleRefine(text);
   }
+
+  async function handleSaveAsFewShot(message: MessageRecord) {
+    if (!message.code || !activeConversation) return;
+    try {
+      await saveAsFewShot({
+        prompt: activeConversation.title,
+        code: message.code,
+        style: activeConversation.style,
+        source_conversation_id: activeConversation.id,
+        source_message_id: message.id,
+      });
+      setStatusLabel("✅ 已收藏为范例");
+      setTimeout(() => setStatusLabel(""), 1500);
+    } catch (e) {
+      setStatusLabel(`收藏失败：${(e as Error).message}`);
+      setTimeout(() => setStatusLabel(""), 2500);
+    }
+  }
+
 
   async function handleCreateFirst(prompt: string) {
     setStatus("creating");
@@ -220,6 +240,7 @@ export default function Page() {
         busy={busy}
         status={statusLabel}
         onSend={handleSend}
+        onSaveAsFewShot={handleSaveAsFewShot}
         disabled={busy}
         // Empty conversation: show a welcoming placeholder.
         placeholder={
