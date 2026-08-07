@@ -214,7 +214,19 @@ async def list_user_messages(
     instructions ("same thing but red" / "also add a label") even though
     we only feed the latest assistant code.
     """
-    return _list_user_messages_sync(session, conversation_id, limit=limit)
+    stmt = (
+        select(Message.content)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.role == "user",
+        )
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    rows.reverse()
+    return [content for content in rows if content]
 
 
 def _append_user_message_sync(session, conversation_id: str, content: str) -> Optional[Message]:

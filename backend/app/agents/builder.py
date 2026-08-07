@@ -5,62 +5,74 @@
   * 工具集（``app.agents.tools``，普通的 ``@tool`` 装饰函数）
   * 结构化输出 schema（``app.agents.schemas.CodeOutput``）
   * 视觉风格（``app.agents.styles``，markdown + few-shot）
+  * 召回的 FewShot（``app.agents.retriever`` + ``few_shot_prompt``）
 
 LangChain 1.x 标准写法：
     ``create_agent(model=chat_model, response_format=PydanticSchema, ...)``
 
     ``model``         — chat model（BaseChatModel，不是 Runnable）
     ``tools``         — @tool 装饰的可调用对象
-    ``system_prompt`` — 单一字符串（base + 选中风格 + 可选额外片段拼接而成）
+    ``system_prompt`` — 单一字符串
+                       （base + 选中风格 + 可选 extra + 召回 few-shot）
     ``response_format`` — 用于结构化输出的 Pydantic schema
-
-切换视觉风格只需要传不同的 ``style_id``。每次会重新构建 agent
-（lru_cache 的 key 包含 style_id 和 extra_system_prompt），不同配置
-的 prompt 模板互相隔离。
-
-注意：因为 ``get_llm()`` 每次会新建一个 ChatOpenAI 客户端，这里先
-显式取一次，保证缓存命中后复用同一个 LLM 实例。
 """
 from __future__ import annotations
 
-from functools import lru_cache
+from typing import Sequence
 
 from langchain.agents import create_agent
 
+from app.agents.few_shot_prompt import with_few_shot_header
 from app.agents.schemas import CodeOutput
 from app.agents.styles import DEFAULT_STYLE_ID, STYLE_IDS, load_style
 from app.agents.tools import render_manim_dryrun, validate_manim_code
+from app.db.models import FewShot
 from app.llm.client import get_llm
 
 
 TOOLS = [validate_manim_code, render_manim_dryrun]
 
 
-@lru_cache
+def _compose_system_prompt(
+    *,
+    style_id: str,
+    extra_system_prompt: str,
+    few_shots: Sequence[FewShot],
+) -> str:
+    """按 style + extra + few_shots 拼出最终 system prompt。"""
+    parts: list[str] = [load_style(style_id).description]
+    if extra_system_prompt:
+        parts.append(extra_system_prompt)
+    fs_block = with_few_shot_header(list(few_shots))
+    if fs_block:
+        parts.append(fs_block)
+    return "\n\n".join(parts)
+
+
 def build_agent(
+    *,
     style_id: str = DEFAULT_STYLE_ID,
     extra_system_prompt: str = "",
+    few_shots: Sequence[FewShot] = (),
 ):
-    """构建指定 (style, extra_prompt) 组合的单例 agent。
+    """构建 agent。HTTP 入口唯一调用。
 
-    参数 ``extra_system_prompt`` 用于多轮调整模式：
-    ``refine.py`` 会在风格 markdown 后面追加一段【精细调整模式】的
-    提示词，让同一套 agent 工厂也能产出"重写旧代码"版本的 agent。
+    不缓存 CompiledStateGraph — LangChain 构建本身是秒级，prompt
+    字符串每次都不同（few-shot 召回随用户输入变化），缓存命中率
+    太低，没有必要。LLM 客户端仍走 ``get_llm()`` 单例复用。
 
-    cache key = (style_id, extra_system_prompt)，所以不同风格的、
-    或者同风格但 extra_prompt 不同的 agent 都会被分别缓存复用。
-
-    返回 LangChain 的 ``CompiledStateGraph``。调用方式：
-    ``await agent.ainvoke({"messages": [...]})``。
-    结构化的 ``CodeOutput`` 会落在 ``result["structured_response"]``。
+    参数：
+      * style_id             — 风格 id
+      * extra_system_prompt  — refine 模式追加的"精细调整"提示词
+      * few_shots            — 召回的 FewShot 列表，按相似度倒序
     """
-    style = load_style(style_id)
-    llm = get_llm()
-    system_prompt = style.description
-    if extra_system_prompt:
-        system_prompt = system_prompt + "\n\n" + extra_system_prompt
+    system_prompt = _compose_system_prompt(
+        style_id=style_id,
+        extra_system_prompt=extra_system_prompt,
+        few_shots=few_shots,
+    )
     return create_agent(
-        model=llm,
+        model=get_llm(),
         tools=TOOLS,
         system_prompt=system_prompt,
         response_format=CodeOutput,

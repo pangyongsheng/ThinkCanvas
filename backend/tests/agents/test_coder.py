@@ -70,11 +70,7 @@ def test_build_agent_uses_create_agent_standard_api():
 
         with patch("app.agents.builder.create_agent") as mock_create:
             mock_create.return_value = "BUILT_AGENT"
-            build_agent.cache_clear()
-            try:
-                agent = build_agent()
-            finally:
-                build_agent.cache_clear()
+            agent = build_agent()
             assert agent == "BUILT_AGENT"
 
             call_kwargs = mock_create.call_args.kwargs

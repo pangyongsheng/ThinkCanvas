@@ -320,7 +320,10 @@ export function subscribeRefine(
     try {
       res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-User-Id": getOrCreateUserId(),
+        },
         body: JSON.stringify({ instruction }),
         signal: controller.signal,
       });

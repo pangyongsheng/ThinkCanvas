@@ -77,7 +77,7 @@ async def render_code(code: str, scene_name: str | None = None) -> RenderResult:
 
         if proc.returncode != 0:
             err_msg = stderr.decode("utf-8", errors="ignore")
-            tail = err_msg[-1000:] if len(err_msg) > 1000 else err_msg
+            tail = err_msg[-3000:] if len(err_msg) > 3000 else err_msg
             return RenderResult(
                 code_path=code_path,
                 video_path=None,

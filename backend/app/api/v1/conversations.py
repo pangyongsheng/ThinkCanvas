@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.refine import run_refine
 from app.agents.react_coder import run_agent
+from app.agents.retriever import retrieve_similar_summaries
 from app.api.v1.render import to_video_url
 from app.core.logging import log_exception
 from app.db.models import Conversation, Message
@@ -150,7 +151,12 @@ async def _render_initial(
     """Run agent + renderer, persist the assistant message, return
     ``(code, video_url, scene_name, duration_sec, assistant_message)``.
     """
-    result = await run_agent(prompt, style_id=style, max_iterations=8)
+    few_shots = await retrieve_similar_summaries(
+        session, prompt=prompt, style=style, top_k=2,
+    )
+    result = await run_agent(
+        prompt, style_id=style, max_iterations=8, few_shots=few_shots,
+    )
     code = result.get("code")
 
     if not code:
@@ -333,12 +339,19 @@ async def refine_conversation(
             yield _sse("started", {"conversation_id": conversation_id, "user_message_id": user_msg_id})
             yield _sse("generating", {"instruction": instruction})
 
+            # 召回 few-shot：按"调整后的整体意图"匹配，即"上一版代码 +
+            # 本次指令"。这里简化用 instruction 做 query（LLM 关注点
+            # 是用户这次要改什么），效果足够。
+            few_shots = await retrieve_similar_summaries(
+                session, prompt=instruction, style=style, top_k=2,
+            )
             result = await run_refine(
                 latest_code,
                 instruction,
                 style_id=style,
                 max_iterations=6,
                 user_history=user_history,
+                few_shots=few_shots,
             )
             code = result.get("code")
             tool_calls = len(result.get("tool_log", []))

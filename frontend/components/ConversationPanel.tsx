@@ -141,7 +141,9 @@ function Bubble({
           </span>
         </div>
         {m.error && (
-          <p className="mt-1 line-clamp-3 text-xs opacity-80">{m.error}</p>
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all text-xs opacity-80">
+            {m.error}
+          </pre>
         )}
         {m.status === "ok" && m.code && onSaveAsFewShot && (
           <button

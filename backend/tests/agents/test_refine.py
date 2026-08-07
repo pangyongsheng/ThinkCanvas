@@ -30,26 +30,11 @@ RUNNABLE_CODE = (
 )
 
 
-@pytest.fixture(autouse=True)
-def _clear_agent_cache():
-    """Reset ``builder.build_agent`` lru_cache around each test.
-
-    Refine goes through ``builder.build_agent(extra_system_prompt=...)``,
-    which is lru_cached. Cached stubs from earlier tests would leak into
-    later ones otherwise.
-    """
-    from app.agents import builder
-
-    builder.build_agent.cache_clear()
-    yield
-    builder.build_agent.cache_clear()
-
-
 def _patch_build_agent(fake_agent):
     """Patch the seam where ``run_refine`` fetches its agent.
 
-    Use as a context manager. The autouse fixture above keeps the
-    lru_cache empty so the patched return value is what refine sees. Note: we patch ``app.agents.refine.build_agent`` (not the one in builder) because refine imported it directly into its own namespace..
+    We patch ``app.agents.refine.build_agent`` (not the one in builder)
+    because refine imported it directly into its own namespace.
     """
     return patch("app.agents.refine.build_agent", return_value=fake_agent)
 
