@@ -10,11 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.middleware.user_id import UserIdMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api.v1.generate import router as generate_router
 from app.api.v1.health import router as health_router
 from app.api.v1.readyz import router as readyz_router
 from app.api.v1.render import router as render_router
-from app.api.v1.tasks import router as tasks_router
 from app.api.v1.conversations import router as conversations_router
 from app.api.v1.few_shots import router as few_shots_router
 from app.config import get_settings, project_root
@@ -84,9 +82,7 @@ def create_app() -> FastAPI:
     # API routes
     app.include_router(health_router, prefix=settings.api_v1_prefix)
     app.include_router(readyz_router, prefix=settings.api_v1_prefix)
-    app.include_router(generate_router, prefix=settings.api_v1_prefix)
     app.include_router(render_router, prefix=settings.api_v1_prefix)
-    app.include_router(tasks_router, prefix=settings.api_v1_prefix)
     app.include_router(conversations_router, prefix=settings.api_v1_prefix)
     app.include_router(few_shots_router, prefix=settings.api_v1_prefix)
 

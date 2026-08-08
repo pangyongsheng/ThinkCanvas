@@ -6,11 +6,13 @@ import { MessageRecord } from "@/lib/api";
 /** 单条步骤日志，对应后端一次 SSE 事件。 */
 type StepKind =
   | "thinking"
+  | "pending"
   | "tool_call"
   | "tool_result"
   | "retry"
   | "code"
   | "rendering"
+  | "rendered"
   | "failed";
 
 export type Step = {

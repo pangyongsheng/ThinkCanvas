@@ -54,8 +54,9 @@ def build_agent(
     style_id: str = DEFAULT_STYLE_ID,
     extra_system_prompt: str = "",
     few_shots: Sequence[FewShot] = (),
+    middleware: Sequence = (),
 ):
-    """构建 agent。HTTP 入口唯一调用。
+    """构建 agent。AgentService 唯一调用。
 
     不缓存 CompiledStateGraph — LangChain 构建本身是秒级，prompt
     字符串每次都不同（few-shot 召回随用户输入变化），缓存命中率
@@ -65,6 +66,11 @@ def build_agent(
       * style_id             — 风格 id
       * extra_system_prompt  — refine 模式追加的"精细调整"提示词
       * few_shots            — 召回的 FewShot 列表，按相似度倒序
+      * middleware           — LangChain 中间件列表（落库 / SSE 等）
+
+    中间件：调用方传已经按 session 注入 DAO 的实例；本函数只做挂载，
+    不参与 DB 写入。``AgentPersistenceMiddleware`` 是默认推荐挂载项，
+    但本函数不强制——便于测试场景替换 mock。
     """
     system_prompt = _compose_system_prompt(
         style_id=style_id,
@@ -76,6 +82,7 @@ def build_agent(
         tools=TOOLS,
         system_prompt=system_prompt,
         response_format=CodeOutput,
+        middleware=list(middleware),
     )
 
 

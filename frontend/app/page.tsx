@@ -23,7 +23,7 @@ type Status = "idle" | "creating" | "generating" | "rendering" | "done" | "faile
 /** 单条步骤日志条目，对应后端一次 SSE 事件。 */
 type Step = {
   id: string;
-  kind: "thinking" | "tool_call" | "tool_result" | "retry" | "code" | "rendering" | "failed";
+  kind: "thinking" | "pending" | "tool_call" | "tool_result" | "retry" | "code" | "rendering" | "rendered" | "failed";
   label: string;
   status?: "ok" | "failed";
   error?: string;
@@ -47,6 +47,22 @@ function buildStepHandlers(
   setStatusLabel: (s: string) => void,
 ) {
   const push = (s: Step) => setSteps((prev) => [...prev, s]);
+  const dropFirstByKind = (kind: Step["kind"]) => setSteps((prev) =>
+    prev.find((s) => s.kind === kind) ? prev.filter((s) => s.kind !== kind) : prev,
+  );
+  const updateLastByKinds = (
+    kinds: Step["kind"][],
+    patch: Partial<Step>,
+  ) => setSteps((prev) => {
+    for (let i = prev.length - 1; i >= 0; i--) {
+      if (kinds.includes(prev[i].kind)) {
+        const copy = prev.slice();
+        copy[i] = { ...copy[i], ...patch };
+        return copy;
+      }
+    }
+    return prev;
+  });
   const updateLast = (
     predicate: (s: Step) => boolean,
     patch: Partial<Step>,
@@ -66,6 +82,7 @@ function buildStepHandlers(
       setStatusLabel("思考中…");
     },
     toolCall: (d: { tool: string }) => {
+      dropFirstByKind("pending");
       push({ id: tempId("step"), kind: "tool_call", label: `调用 ${prettyTool(d.tool)}` });
       setStatusLabel("校验中…");
     },
@@ -82,14 +99,31 @@ function buildStepHandlers(
       push({ id: tempId("step"), kind: "retry", label: `重试（第 ${d.attempt} 次：${d.reason}）` });
     },
     code: () => {
+      dropFirstByKind("pending");
       push({ id: tempId("step"), kind: "code", label: "代码生成完成" });
       setStatusLabel("正在编译视频…");
     },
     rendering: () => {
+      dropFirstByKind("pending");
       push({ id: tempId("step"), kind: "rendering", label: "正在编译视频…" });
     },
     failed: (d: { error: string }) => {
       push({ id: tempId("step"), kind: "failed", label: `❌ ${d.error}` });
+    },
+    /** Push an immediate "正在思考…" step so the panel isn't empty. */
+    pending: (label = "正在思考…") => {
+      push({ id: tempId("step"), kind: "pending", label });
+    },
+    /** On ``done``: replace the trailing rendering/pending step with success. */
+    finalizeRendering: (durationSec?: number) => {
+      const finalLabel =
+        typeof durationSec === "number" && durationSec > 0
+          ? `渲染完成 · ${durationSec.toFixed(1)}s`
+          : "渲染完成";
+      updateLastByKinds(
+        ["rendering", "pending"],
+        { kind: "rendered", label: finalLabel, status: "ok" },
+      );
     },
   };
 }
@@ -216,6 +250,7 @@ export default function Page() {
 
     setSteps([]);
     const stepHandlers = buildStepHandlers(setSteps, setStatusLabel);
+    stepHandlers.pending?.();
 
     const sub = subscribeCreateConversation(
       prompt,
@@ -224,6 +259,8 @@ export default function Page() {
         ...stepHandlers,
         started: () => setStatusLabel("开始生成…"),
         done: async (created) => {
+          const durationSec = created?.duration_sec ?? undefined;
+          stepHandlers.finalizeRendering?.(durationSec);
           const fresh = await getConversation(created.conversation.id);
           setActiveConversation(fresh);
           setStatus("done");
@@ -270,13 +307,16 @@ export default function Page() {
     const idAtSubscribe = activeConversation.id;
     setSteps([]);
     const stepHandlers = buildStepHandlers(setSteps, setStatusLabel);
+    stepHandlers.pending?.("正在分析调整要求…");
 
     abortRef.current = subscribeRefine(idAtSubscribe, instruction, {
       ...stepHandlers,
       started: () => setStatusLabel("开始调整…"),
       generating: () => setStatusLabel("调用模型…"),
       rendering: () => setStatus("rendering"),
-      done: async () => {
+      done: async (payload) => {
+        const durationSec = payload?.duration_sec ?? undefined;
+        stepHandlers.finalizeRendering?.(durationSec);
         const fresh = await getConversation(idAtSubscribe);
         // Only apply if we're still on the same conversation (no race).
         setActiveConversation((cur) => (cur?.id === idAtSubscribe ? fresh : cur));

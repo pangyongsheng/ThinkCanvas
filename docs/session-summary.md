@@ -144,3 +144,65 @@ frontend/
 | **端到端压测** | 3 算法 × 10 次成功率 / 时长（Step 6） | 中 |
 | **Worker 异步化** | `rq.enqueue` 解 API 阻塞 | 低（v1.x） |
 | **OSS / S3** | 视频存储 | 低 |
+
+
+### 12. 解耦重构：Web → Agent → DAO（2026-08-08）
+
+按"硬性规范"全面解耦：
+- **Web 层** 只做 HTTP 接收 / 鉴权 / 调 AgentService / 渲染 / SSE，不再接触 ORM 与 agent 业务
+- **Agent 层** 收拢 agent 业务 + LLM 调用 + 工具捕获；通过 LangChain `AgentMiddleware` 自动落库
+- **DAO 层** 单一数据访问入口，路由层严禁直写 SQL
+
+#### 新增
+- `backend/app/agents/dao/agent_steps.py` — `AgentStepsDAO.write_steps` 批量落 `agent_steps`；`_serialize_tool_args` 把 dict 序列化成 VARCHAR
+- `backend/app/agents/dao/messages.py` — `MessagesDAO`（`append_user_message` / `create_assistant_shell` / `finalize_after_agent` / `attach_video` / `mark_failed`）
+- `backend/app/agents/dao/conversations.py` — `ConversationsDAO`（`create` / `get` / `list` / `delete` / `list_user_messages`） + 视频文件清理 helpers
+- `backend/app/agents/middleware/persistence.py` — `AgentPersistenceMiddleware`，挂 LangChain 原生 `abefore_agent` / `awrap_tool_call` / `aafter_agent` 钩子
+- `backend/app/agents/service.py` — `AgentService` 编排器（`run_initial` / `run_refine` / `attach_video` / `mark_render_failed` / `mark_agent_failed`）
+
+#### 删除
+- `backend/app/storage/conversations.py` — 内容已并入 `agents/dao/conversations.py`
+- `backend/app/api/v1/generate.py` — legacy `/generate` `/generate/stream` `/generate/agent`；前端没有调用，已被 `/api/v1/conversations` 完全替代
+- `backend/app/api/v1/tasks.py` — legacy `/tasks` CRUD；前端没有调用
+- `backend/app/storage/tasks.py` — 仅被 `tasks.py` 路由使用
+- `backend/tests/agents/test_tasks_crud.py` — 与删掉的 storage 配套
+- `backend/tests/storage/test_conversations.py` / `test_user_scope.py` — 旧 storage 测试
+
+#### 修复的 BUG
+1. **重复 user 消息写入** — 旧 `ConversationsDAO.create` 顺手建 user 消息，`AgentService.run_initial` 又调 `MessagesDAO.append_user_message`，导致**每次新建会话会插入两条 user 消息**。新方案：`ConversationsDAO.create` 只建会话，user 消息统一由 `MessagesDAO.append_user_message` 创建。
+2. **`tool_args` dict → VARCHAR** — 原 `write_agent_steps` 把 dict 直接传 `tool_args`（VARCHAR）会运行时崩。`_serialize_tool_args` 现在落在 `agents/dao/agent_steps.py`，所有 dict/list 调用点自动 JSON 化。
+3. **ToolMessage status 默认值** — 原 `if status != "ok"` 把 LangChain 默认的 `"success"` 误标 failed。现在中间件用 `status == "error"` 单向判断（其他一律视为 ok），避开默认值差异。
+4. **refine 路径漏写 `agent_steps`** — 原 `/refine` 路由手动调 `write_agent_steps` 但路径不全；首次生成路径则漏配。新方案一处中间件覆盖所有 agent 调用入口，零复制粘贴。
+5. **冗余的 ctx["message_id"] 回写** — middleware 把 message_id 写回 runtime.context 但代码从未读取；改为只存实例变量，删除冗余。
+6. **同步 middleware 命名冲突** — 基类 `AgentMiddleware.before_agent`/`after_agent` 是 sync 空实现；agent.ainvoke 走 async 路径必须实现 `abefore_agent`/`aafter_agent`/`awrap_tool_call`。原实现用的是 sync 方法名但内部 `async def` —— 工厂链能识别（`m.__class__.awrap_tool_call is not AgentMiddleware.awrap_tool_call`），但接口语义不准。已统一改成 `a` 前缀的 async 方法。
+
+#### 分层架构
+```
+Web (app/api/v1/conversations.py)
+ ├─ 接收 HTTP / 鉴权 / 参数校验
+ ├─ 调 AgentService 跑 agent（拿到 AgentRunResult）
+ ├─ 调 Manim 渲染
+ ├─ 把 video_url 回填（AgentService.attach_video）
+ └─ SSE 推送事件
+            │
+            ▼
+Agent (app/agents/service.py + middleware/persistence.py)
+ ├─ AgentService.run_initial / run_refine — 业务编排
+ ├─ AgentPersistenceMiddleware
+ │   ├─ abefore_agent  → MessagesDAO.create_assistant_shell
+ │   ├─ awrap_tool_call → AgentStepsDAO.write_steps（落库 + SSE）
+ │   └─ aafter_agent   → MessagesDAO.finalize_after_agent
+ └─ invoke_with_recovery — LLM 输出兜底
+            │
+            ▼
+DAO (app/agents/dao/*.py)
+ ├─ AgentStepsDAO  — agent_steps 表
+ ├─ MessagesDAO    — messages 表
+ └─ ConversationsDAO — conversations 表 + 视频文件清理
+```
+
+#### 验证
+- `pytest -q`：**100 passed**（100 个用例覆盖原 107 - 删除 7 个 storage/tasks 相关）
+- `mypy app/agents/...`：本次重构的 6 个文件**零错误**（其余错误为历史遗留）
+- `app.main.app.openapi()`：路由列表只剩 conversations/few_shots/health/readyz/render，**不再有** `/generate`、`/tasks`
+

@@ -145,118 +145,134 @@ async def test_normal_structured_response_still_works():
     assert "TrapezoidArea(Scene)" in result["code"]
 
 
+
 @pytest.mark.asyncio
-async def test_invoke_with_recovery_emits_on_event():
-    """invoke_with_recovery should emit thinking + tool events via on_event callback."""
-    from app.agents.agent_recovery import invoke_with_recovery
-    from langchain_core.messages import AIMessage, ToolMessage
+async def test_middleware_calls_dao_with_tool_steps():
+    """AgentPersistenceMiddleware.wrap_tool_call 应调用 dao_steps.write_steps 落库。"""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.middleware.persistence import AgentPersistenceMiddleware
+    from langchain_core.messages import ToolMessage
 
-    # mock 一个 agent：返回包含 tool_call + tool_result 的消息
-    fake_agent = MagicMock()
+    # Mock DAO — 不依赖 DB
+    dao_steps = MagicMock()
+    dao_steps.write_steps = AsyncMock(return_value=1)
+    dao_messages = MagicMock()
+    dao_messages.create_assistant_shell = AsyncMock(
+        return_value=MagicMock(id="msg_123"),
+    )
+    dao_messages.finalize_after_agent = AsyncMock()
 
-    async def _fake_ainvoke(*_args, **_kwargs):
-        return {
-            "messages": [
-                AIMessage(
-                    content="",
-                    tool_calls=[
-                        {"id": "call_1", "name": "validate_manim_code", "args": {"code": "x"}},
-                    ],
-                ),
-                ToolMessage(content="ok", tool_call_id="call_1"),
-                AIMessage(content="done"),
-            ],
-            "structured_response": None,
-        }
+    middleware = AgentPersistenceMiddleware(
+        dao_steps=dao_steps, dao_messages=dao_messages,
+    )
 
-    fake_agent.ainvoke = _fake_ainvoke
+    class FakeRuntime:
+        context = {"conversation_id": "conv_1"}
+    class FakeState:
+        def get(self, k, default=None): return default
 
-    # 抓事件
-    events: list[tuple[str, dict]] = []
+    await middleware.abefore_agent(FakeState(), FakeRuntime())
+    assert middleware._message_id == "msg_123"
+    dao_messages.create_assistant_shell.assert_awaited_once_with(conversation_id="conv_1")
 
-    async def on_event(event: str, data: dict) -> None:
+    class FakeRequest:
+        tool_call = {"id": "call_1", "name": "validate_manim_code", "args": {"code": "x"}}
+    async def handler(req):
+        return ToolMessage(content="ok", tool_call_id="call_1")
+    result = await middleware.awrap_tool_call(FakeRequest(), handler)
+    assert isinstance(result, ToolMessage)
+    assert len(middleware._steps) == 1
+    assert middleware._steps[0]["tool_name"] == "validate_manim_code"
+    assert middleware._steps[0]["tool_result"] == "ok"
+
+    # after_agent: 调 write_steps + finalize_after_agent
+    class FakeState2:
+        def get(self, k, default=None):
+            if k == "structured_response":
+                class S:
+                    code = "from manim import *\nclass A(Scene): pass"
+                return S()
+            return default
+    class FakeRuntime2:
+        context = {}
+    await middleware.aafter_agent(FakeState2(), FakeRuntime2())
+
+    dao_steps.write_steps.assert_awaited_once()
+    call_kwargs = dao_steps.write_steps.await_args.kwargs
+    assert call_kwargs["message_id"] == "msg_123"
+    assert len(call_kwargs["steps"]) == 1
+
+    dao_messages.finalize_after_agent.assert_awaited_once_with(
+        message_id="msg_123",
+        code="from manim import *\nclass A(Scene): pass",
+        scene_name="A",
+        status="ok",
+    )
+
+
+@pytest.mark.asyncio
+async def test_middleware_emits_sse_events_via_on_event():
+    """runtime.context 传 on_event 时，wrap_tool_call 应发 SSE 事件。"""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.middleware.persistence import AgentPersistenceMiddleware
+    from langchain_core.messages import ToolMessage
+
+    dao_steps = MagicMock()
+    dao_steps.write_steps = AsyncMock(return_value=0)
+    dao_messages = MagicMock()
+    dao_messages.create_assistant_shell = AsyncMock(return_value=MagicMock(id="m1"))
+    dao_messages.finalize_after_agent = AsyncMock()
+
+    events = []
+    async def emit(event, data):
         events.append((event, data))
 
-    result = await invoke_with_recovery(
-        fake_agent,
-        {"messages": []},
-        max_iterations=4,
-        label="test",
-        style_id="3b1b",
-        on_event=on_event,
+    middleware = AgentPersistenceMiddleware(
+        dao_steps=dao_steps, dao_messages=dao_messages,
     )
+
+    class FakeRuntime:
+        context = {"conversation_id": "c1", "on_event": emit}
+    class FakeState:
+        def get(self, k, default=None): return default
+    await middleware.abefore_agent(FakeState(), FakeRuntime())
+
+    class FakeRequest:
+        tool_call = {"id": "c1", "name": "validate_manim_code", "args": {}}
+    async def handler(req):
+        return ToolMessage(content="ok", tool_call_id="c1")
+    await middleware.awrap_tool_call(FakeRequest(), handler)
 
     kinds = [e[0] for e in events]
-    assert "thinking" in kinds, f"expected thinking event, got {kinds}"
-    assert "tool_call" in kinds, f"expected tool_call event, got {kinds}"
-    assert "tool_result" in kinds, f"expected tool_result event, got {kinds}"
-
-    # tool_call data 应包含 tool name
+    assert "tool_call" in kinds
+    assert "tool_result" in kinds
     tool_call_data = next(d for e, d in events if e == "tool_call")
     assert tool_call_data["tool"] == "validate_manim_code"
-
-    # tool_result data 应包含 status
     tool_result_data = next(d for e, d in events if e == "tool_result")
     assert tool_result_data["status"] == "ok"
-    assert tool_result_data["tool"] == "validate_manim_code"
-
-    # thinking 事件应在 ainvoke 之前发出
-    assert kinds[0] == "thinking"
 
 
 @pytest.mark.asyncio
-async def test_invoke_with_recovery_no_callback_unchanged():
-    """不传 on_event 时行为应该跟以前一模一样 —— 无 callback。"""
-    from app.agents.agent_recovery import invoke_with_recovery
-    from langchain_core.messages import AIMessage
+async def test_middleware_swallows_on_event_errors():
+    """on_event 抛错不能影响 middleware 主流程。"""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.agents.middleware.persistence import AgentPersistenceMiddleware
 
-    fake_agent = MagicMock()
+    dao_steps = MagicMock()
+    dao_messages = MagicMock()
+    dao_messages.create_assistant_shell = AsyncMock(return_value=MagicMock(id="m1"))
 
-    async def _fake_ainvoke(*_args, **_kwargs):
-        return {
-            "messages": [AIMessage(content="hello")],
-            "structured_response": None,
-        }
+    async def bad_on_event(event, data):
+        raise RuntimeError("boom")
 
-    fake_agent.ainvoke = _fake_ainvoke
-
-    # 不传 on_event 也不应该报错
-    result = await invoke_with_recovery(
-        fake_agent,
-        {"messages": []},
-        max_iterations=4,
-        label="test",
-        style_id="3b1b",
+    middleware = AgentPersistenceMiddleware(
+        dao_steps=dao_steps, dao_messages=dao_messages,
     )
-    assert result is not None
 
-
-@pytest.mark.asyncio
-async def test_invoke_with_recovery_swallows_callback_errors():
-    """callback 抛错不能影响主流程。"""
-    from app.agents.agent_recovery import invoke_with_recovery
-    from langchain_core.messages import AIMessage
-
-    fake_agent = MagicMock()
-
-    async def _fake_ainvoke(*_args, **_kwargs):
-        return {
-            "messages": [AIMessage(content="hello")],
-            "structured_response": None,
-        }
-
-    fake_agent.ainvoke = _fake_ainvoke
-
-    async def bad_on_event(event: str, data: dict) -> None:
-        raise RuntimeError("callback intentionally broken")
-
-    # 不应该抛
-    result = await invoke_with_recovery(
-        fake_agent,
-        {"messages": []},
-        max_iterations=4,
-        label="test",
-        style_id="3b1b",
-        on_event=bad_on_event,
-    )
-    assert result is not None
+    class FakeRuntime:
+        context = {"conversation_id": "c1", "on_event": bad_on_event}
+    class FakeState:
+        def get(self, k, default=None): return default
+    # before_agent 里 on_event 调用应被吞掉
+    await middleware.abefore_agent(FakeState(), FakeRuntime())
+    assert middleware._message_id == "m1"

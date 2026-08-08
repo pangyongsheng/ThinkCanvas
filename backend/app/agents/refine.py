@@ -1,6 +1,8 @@
-"""精细调整模式 agent：基于上一版代码产出新的 Manim 版本。
+"""``refine`` — 多轮调整 LLM wrapper（无中间件、无落库）。
 
-用在多轮对话流程中。用户已经有了一个能跑的动画，我们让 LLM：
+仅供 ``tests/agents/test_refine`` 校验；**生产入口**走 ``AgentService.run_refine``。
+
+用户已经有了一个能跑的动画，我们让 LLM：
 
   * 保留 ``from manim import *`` 和 Scene 类名（除非用户明确说要改）
   * 只针对用户的调整要求做最小改动
@@ -14,10 +16,6 @@
 
 不喂 assistant 历史回复 — 既省 token，渐进式需求也已经能从
 "用户说过的话"里看出来。
-
-实现上直接复用 ``run_agent`` 的提码流水线（通过
-``agent_recovery.invoke_with_recovery``），这样 MiniMax thinking-block
-兜底逻辑在两种模式下行为一致。
 """
 from __future__ import annotations
 
@@ -30,7 +28,6 @@ from app.agents.agent_recovery import invoke_with_recovery
 from app.agents.builder import build_agent
 from app.agents.styles import DEFAULT_STYLE_ID
 from app.db.models import FewShot
-from app.llm.client import get_llm
 
 
 logger = logging.getLogger("thinkcanvas.agent.refine")
@@ -74,55 +71,36 @@ async def run_refine(
     prev_code: str,
     instruction: str,
     *,
-    style_id: str = DEFAULT_STYLE_ID,
-    max_iterations: int = 4,
     user_history: list[str] | None = None,
+    style_id: str = DEFAULT_STYLE_ID,
+    max_iterations: int = 6,
     few_shots: Sequence[FewShot] = (),
-    on_event=None,
 ) -> dict:
-    """构建一次性 agent，按 ``instruction`` 重写 ``prev_code``。
+    """构建 refine agent 并跑 ``ainvoke``。
 
-    返回与 ``run_agent`` 相同形状::
+    返回 dict 形状：``{"code": str|None, "messages": [...]}``。
 
-        {"code": str|None, "tool_log": [...], "messages": [...]}
-
-    ``few_shots`` 由调用方（HTTP 入口）先调 ``retriever`` 召回后传入；
-    这里只负责拼到 system prompt 里。
+    生产路径不应使用本函数——调它不会落 ``agent_steps`` 表。
+    生产入口请走 ``AgentService.run_refine``。
     """
-    if not prev_code.strip():
-        raise ValueError("prev_code is empty — cannot refine")
-    if not instruction.strip():
-        raise ValueError("instruction is empty — nothing to refine")
+    if not prev_code or not prev_code.strip():
+        raise ValueError("refine.run_refine: prev_code is empty")
+    if not instruction or not instruction.strip():
+        raise ValueError("refine.run_refine: instruction is empty")
 
-    # LLM 客户端用单例；build_agent 内部会再调一次，行为一致。
-    get_llm()
     agent = build_agent(
         style_id=style_id,
         extra_system_prompt=_SYSTEM_REFINE_PREAMBLE,
         few_shots=list(few_shots),
     )
-
-    prompt = _build_refine_prompt(prev_code, instruction, user_history)
-    logger.info(
-        "agent.refine start style=%s instruction=%r prev_len=%d",
-        style_id,
-        instruction[:80],
-        len(prev_code),
-    )
-    result = await invoke_with_recovery(
+    prompt_text = _build_refine_prompt(prev_code, instruction, user_history)
+    return await invoke_with_recovery(
         agent,
-        {"messages": [HumanMessage(content=prompt)]},
+        {"messages": [HumanMessage(content=prompt_text)]},
         max_iterations=max_iterations,
         label="agent.refine",
         style_id=style_id,
-        on_event=on_event,
     )
-    logger.info(
-        "agent.refine end code=%s tool_calls=%d",
-        "OK" if result["code"] else "NONE",
-        len(result["tool_log"]),
-    )
-    return result
 
 
 __all__ = ["run_refine"]
