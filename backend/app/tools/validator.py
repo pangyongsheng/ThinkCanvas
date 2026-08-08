@@ -18,6 +18,18 @@ DANGEROUS_PATTERNS: list[str] = [
     r"while\s+True\s*:",                  # infinite loop
 ]
 
+# LLM 思路草稿泄漏到代码注释里。注释行匹配 — 多行模式。
+# Manim 教学动画里几乎不会出现这种自然注释，命中几乎一定是
+# coder 没清掉自己的 chain-of-thought。
+COT_LEAK_PATTERNS: list[str] = [
+    r"^\s*#\s*Hmm\b",
+    r"^\s*#\s*Actually,?\s+(?:let me|I|we)\b",
+    r"^\s*#\s*OK,?\s*let me\b",
+    r"^\s*#\s*Let me\s+(?:rethink|restart|try|show)\b",
+    r"^\s*#\s*(?:Simpler approach|Better:|Lemme)\b",
+    r"^\s*#\s*Wait,?\s+this\s+(?:might|is)\b",
+]
+
 
 def validate_code(code: str) -> tuple[bool, str]:
     """Validate LLM-generated Manim code. Returns (ok, error_message)."""
@@ -30,13 +42,18 @@ def validate_code(code: str) -> tuple[bool, str]:
         if re.search(pattern, code):
             return False, f"dangerous pattern detected: {pattern}"
 
-    # 3. AST parse
+    # 3. LLM 思路草稿泄漏 — 注释行级检测。
+    for pattern in COT_LEAK_PATTERNS:
+        if re.search(pattern, code, re.MULTILINE):
+            return False, f"chain-of-thought leaked into comments: {pattern}"
+
+    # 4. AST parse
     try:
         tree = ast.parse(code)
     except SyntaxError as e:
         return False, f"syntax error: {e}"
 
-    # 4. Scene subclass with construct()
+    # 5. Scene subclass with construct()
     has_scene = any(
         isinstance(node, ast.ClassDef)
         and any(

@@ -41,13 +41,14 @@ async def run_agent(
         style_id=style_id,
         few_shots=list(few_shots),
     )
-    return await invoke_with_recovery(
+    result = await invoke_with_recovery(
         agent,
         {"messages": [HumanMessage(content=prompt)]},
         max_iterations=max_iterations,
         label="agent.run",
         style_id=style_id,
     )
+    return result
 
 
 __all__ = ["run_agent"]

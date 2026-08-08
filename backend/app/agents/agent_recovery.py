@@ -39,6 +39,7 @@ async def invoke_with_recovery(
     max_iterations: int,
     label: str,
     style_id: str,
+    callbacks: list | None = None,
 ) -> dict:
     """调用 ``agent.ainvoke`` 并通过多层兜底链恢复代码。
 
@@ -54,6 +55,8 @@ async def invoke_with_recovery(
       全烧在 thinking 里，根本没产出真正的答案。
     """
     config = {"recursion_limit": max_iterations * 4 + 1}  # type: ignore[dict-item]
+    if callbacks:
+        config["callbacks"] = callbacks  # type: ignore[dict-item]
 
     last_result = None
     for attempt in range(2):  # original + 1 retry
@@ -119,6 +122,14 @@ def _looks_truncated(result: dict) -> bool:
     return len(text_payload.strip()) < 20
 
 
+def _truncate_dict(d: dict, *, limit: int) -> dict:
+    """把 dict 里的所有字符串值截到 ``limit`` 字符，非字符串原样保留。"""
+    return {
+        k: (v[:limit] if isinstance(v, str) else v)
+        for k, v in d.items()
+    }
+
+
 def extract_from_result(result: dict, *, label: str, style_id: str) -> dict:
     """按多层兜底链执行提取，并组装成最终的响应 dict。"""
     structured = result.get("structured_response")
@@ -166,23 +177,68 @@ def extract_from_result(result: dict, *, label: str, style_id: str) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
-    for msg in messages:
+    # 同时收集 tool_log（旧汇总）和 tool_steps（新明细）。
+    # tool_steps 包含 tool_call 和对应 tool_result，按 step_index 顺序排列，
+    # 落 agent_steps 表用。tool_call_id 配对 AIMessage.tool_calls 和 ToolMessage。
+    tool_steps: list[dict] = []
+    pending_calls: dict[str, dict] = {}  # tool_call_id -> 最近的 tool_call step
+
+    for idx, msg in enumerate(messages):
+        msg_type = type(msg).__name__
+
+        # AIMessage 带 tool_calls → 记录调用
         for tc in (getattr(msg, "tool_calls", None) or []):
+            tc_id = tc.get("id")
+            step = {
+                "step_index": idx,
+                "step_type": "tool_call",
+                "tool_name": tc.get("name"),
+                "tool_call_id": tc_id,
+                "tool_args": _truncate_dict(tc.get("args") or {}, limit=1000),
+                "tool_result": None,
+                "error": None,
+            }
+            tool_steps.append(step)
+            if tc_id:
+                pending_calls[tc_id] = step
             tool_log.append({
-                "tool": tc.get("name"),
+                "tool": step["tool_name"],
                 "args": {k: str(v)[:200] for k, v in (tc.get("args") or {}).items()},
-                "id": tc.get("id"),
+                "id": tc_id,
             })
 
+        # ToolMessage → 把 result/error 写回对应 tool_call step
+        if msg_type == "ToolMessage":
+            tc_id = getattr(msg, "tool_call_id", None)
+            content = getattr(msg, "content", "")
+            status = getattr(msg, "status", "ok")
+            result_text = str(content)[:4000]
+            if tc_id and tc_id in pending_calls:
+                pending_calls[tc_id]["tool_result"] = result_text
+                if status != "ok":
+                    pending_calls[tc_id]["error"] = result_text
+            else:
+                # 孤儿 ToolMessage（没匹配到 AIMessage.tool_call），单独落一条
+                tool_steps.append({
+                    "step_index": idx,
+                    "step_type": "tool_result",
+                    "tool_name": getattr(msg, "name", None),
+                    "tool_call_id": tc_id,
+                    "tool_args": None,
+                    "tool_result": result_text,
+                    "error": None if status == "ok" else result_text,
+                })
+
     logger.info(
-        "%s.end code=%s tool_calls=%d messages=%d",
+        "%s.end code=%s tool_calls=%d steps=%d messages=%d",
         label, "OK" if final_code else "NONE",
-        len(tool_log), len(messages),
+        len(tool_log), len(tool_steps), len(messages),
     )
 
     return {
         "code": final_code,
         "tool_log": tool_log,
+        "tool_steps": tool_steps,
         "messages": [str(getattr(m, "content", m)) for m in messages],
     }
 

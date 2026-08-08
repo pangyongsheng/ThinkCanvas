@@ -102,18 +102,44 @@ frontend/
 ```
 
 ### 8. 测试
-- pytest：**61 passed**
-  - 38 → 40（agent_recovery / refine 单元测试）
-  - + 5（user history cap）
-  - + 11（user_id middleware）
-  - + 5（user-scoped conversation 行为）
+- pytest：**107 passed**（截至 2026-08-08）
+  - 61 → 107（含 +46 few-shot / retriever / summarizer / embeddings / backfill）
 - tsc：`./node_modules/.bin/tsc --noEmit` 无错
+
+## 2026-08-07 ~ 08-08 增量（补 session 漏掉的部分）
+
+### 9. Few-shot 库 SQL 检索版 ✅ 完成
+
+把 `shared/prompts/styles/*.md` 硬编码的 few-shot 抽到 `few_shots` 表，embedding 检索 + 自动 summarization。
+
+- 新表：`few_shots(id, prompt, code, summary, summary_embedding JSONB, style, source_*, created_at)`
+- 迁移：`20260807_add_few_shots.py` / `20260807_add_few_shot_summary.py` / `20260807_add_few_shot_embedding.py`
+- 服务端：`app/agents/retriever.py::retrieve_similar_summaries`（cosine 相似度 top_k=2）
+- Prompt 拼装：`app/agents/few_shot_prompt.py::with_few_shot_header`（`builder.py:46` 调用）
+- 接入路径：`conversations.py:154`（首次生成）+ `conversations.py:364`（refine），都走 `retrieve_similar_summaries`
+- HTTP endpoint：`POST /api/v1/few_shots` / `GET /api/v1/few_shots`（详见 `app/api/v1/few_shots.py`）
+- **摘要生成**：`app/agents/summarizer.py::summarise_few_shot`（LLM 生成简短 description 作为 embedding 锚点）
+- **embedding backfill**：新条目入表后异步跑 `_backfill_embedding` 写 `summary_embedding`
+
+### 10. 前端「👍 收藏为范例」按钮 ✅ 完成
+
+- `ConversationPanel.tsx:153` — 按钮（仅 assistant 消息可见）
+- `page.tsx:95` — `handleSaveAsFewShot` → `saveAsFewShot` API
+- 用户手动收藏的好例子自动入 `few_shots` 表，retriever 下次会按相似度召回
+
+### 11. LangSmith 集成尝试 → 移除（2026-08-08）
+
+短暂接入了 `TraceIdCapture` callback + `messages.trace_id` 列，但服务端 LangSmith tracing 没真启用（无 `LANGCHAIN_API_KEY`），跑通是死数据。**全部回滚**：
+
+- 删 `app/agents/observability.py`
+- 移除 `react_coder.py` 的 callback + result["trace_id"]
+- 移除 `message.py` / `agent_step.py` 的 `trace_id` 列、`.env.example` 的 LangSmith section、`config.py` 的 `langchain_*` 字段
+- 保留 `add_trace_id` migration（已应用到 DB 的列保留，下次需要可快速回滚）
 
 ## 已知 TODO（下一步）
 
 | 项 | 说明 | 优先级 |
 |---|---|---|
-| **few-shot 库（SQL 检索版）** | 把 `shared/prompts/styles/*.md` 里硬编码的 few-shot 抽到 `few_shots` 表；按 prompt 关键词选 1-2 个拼进 system prompt | 高 |
 | **持久化记忆** | `user_preferences`（语言 / 默认风格）+ `user_algorithm_history`（user × 算法 × 时间）；创建会话时塞进 system prompt | 中 |
 | **端到端压测** | 3 算法 × 10 次成功率 / 时长（Step 6） | 中 |
 | **Worker 异步化** | `rq.enqueue` 解 API 阻塞 | 低（v1.x） |

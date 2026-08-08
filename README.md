@@ -71,7 +71,7 @@ npm install
 npm run dev
 
 # 4. 测试 & 类型检查
-cd backend && python -m pytest -q    # 96 passed
+cd backend && python -m pytest -q    # 107 passed
 cd frontend && ./node_modules/.bin/tsc --noEmit
 ```
 

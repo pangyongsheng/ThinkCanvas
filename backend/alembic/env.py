@@ -17,6 +17,7 @@ from app.db.models import conversation  # noqa: F401
 from app.db.models import message  # noqa: F401
 from app.db.models import user  # noqa: F401
 from app.db.models import few_shot  # noqa: F401
+from app.db.models import agent_step  # noqa: F401
 
 config = context.config
 

@@ -131,7 +131,7 @@ backend/
 
 shared/prompts/
 ├── system/v1.txt                     # System prompt（含硬性约束）
-└── examples/                         # ⚠️ 当前为空目录；v1 只剩"冒泡排序"在 system prompt 里
+└── (空)                              # 早期 hardcoded few-shot 目录已废弃；改为 few_shots 表 + embedding 检索
 
 frontend/
 ├── app/page.tsx                      # EventSource 订阅 + 进度条 + 视频 + 代码框

@@ -132,7 +132,7 @@ backend/alembic/versions/
 ├── 20260806_add_conversations_and_messages.py
 └── 20260806_add_users_and_user_id.py    # users + conv.user_id + anon backfill
 
-backend/tests/                            # 61 passed
+backend/tests/                            # 107 passed (2026-08-08)
 ├── conftest.py
 ├── agents/                               # agent_recovery / refine / coder
 ├── storage/                              # user history cap + user scope

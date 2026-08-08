@@ -158,11 +158,20 @@ async def _render_initial(
         prompt, style_id=style, max_iterations=8, few_shots=few_shots,
     )
     code = result.get("code")
+    tool_log = result.get("tool_log", [])
+    tool_steps = result.get("tool_steps", [])
+    tool_calls = len(tool_log)
 
     if not code:
         msg = await conv_store.write_assistant_message(
-            session, conversation_id, status="failed", content="生成失败", error="agent failed to produce code"
+            session, conversation_id, status="failed",
+            content="生成失败", error="agent failed to produce code",
+            tool_calls=tool_calls,
         )
+        await conv_store.write_agent_steps(
+            session, message_id=msg.id, steps=tool_steps,
+        )
+        await session.commit()
         return None, None, None, None, msg
 
     scene_name = extract_scene_name(code)
@@ -179,7 +188,12 @@ async def _render_initial(
             scene_name=scene_name,
             duration_sec=render_result.duration_sec,
             error=err,
+            tool_calls=tool_calls,
         )
+        await conv_store.write_agent_steps(
+            session, message_id=msg.id, steps=tool_steps,
+        )
+        await session.commit()
         return code, None, scene_name, render_result.duration_sec, msg
 
     video_url = to_video_url(render_result.video_path)
@@ -192,7 +206,12 @@ async def _render_initial(
         video_url=video_url,
         scene_name=scene_name,
         duration_sec=render_result.duration_sec,
+        tool_calls=tool_calls,
     )
+    await conv_store.write_agent_steps(
+        session, message_id=msg.id, steps=tool_steps,
+    )
+    await session.commit()
     return code, video_url, scene_name, render_result.duration_sec, msg
 
 

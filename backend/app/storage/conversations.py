@@ -8,6 +8,7 @@ remain in place for chronological display but with those columns cleared.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import select
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import project_root
-from app.db.models import Conversation, Message
+from app.db.models import AgentStep, Conversation, Message
 
 
 logger = logging.getLogger("thinkcanvas.storage.conversations")
@@ -265,6 +266,7 @@ def _write_assistant_message_sync(
     scene_name: Optional[str] = None,
     duration_sec: Optional[float] = None,
     error: Optional[str] = None,
+    tool_calls: Optional[int] = None,
 ) -> Optional[Message]:
     """Sync core — see ``write_assistant_message`` for full docstring."""
     stmt = select(Message).where(
@@ -288,6 +290,7 @@ def _write_assistant_message_sync(
         scene_name=scene_name,
         duration_sec=duration_sec,
         error=error,
+        tool_calls=tool_calls,
     )
     session.add(msg)
 
@@ -312,12 +315,16 @@ async def write_assistant_message(
     scene_name: Optional[str] = None,
     duration_sec: Optional[float] = None,
     error: Optional[str] = None,
+    tool_calls: Optional[int] = None,
 ) -> Optional[Message]:
     """Insert the assistant's latest turn.
 
     Clears ``code``/``video_url`` on any prior assistant row for this
     conversation so the *only* place those values live is the newest
     one — keeps the UI from accidentally rendering stale media.
+
+    ``tool_calls`` — 这次生成 LLM 实际触发的工具调用总次数（汇总指标）。
+    明细见 ``write_agent_steps`` 落 agent_steps 表。
     """
     stmt = select(Message).where(
         Message.conversation_id == conversation_id,
@@ -340,6 +347,7 @@ async def write_assistant_message(
         scene_name=scene_name,
         duration_sec=duration_sec,
         error=error,
+        tool_calls=tool_calls,
     )
     session.add(msg)
 
@@ -413,3 +421,41 @@ __all__ = [
     "write_assistant_message",
     "delete_conversation",
 ]
+
+
+
+async def write_agent_steps(
+    session: AsyncSession,
+    *,
+    message_id: str | None = None,
+    task_id: str | None = None,
+    steps: list[dict],
+) -> int:
+    """批量插入 agent 执行步骤。
+
+    ``steps`` 元素格式（来自 ``agent_recovery.extract_from_result`` 的
+    ``tool_steps`` 字段）：
+        ``step_index / step_type / tool_name / tool_call_id / tool_args /
+        tool_result / error``
+
+    返回插入行数。
+    """
+    if not steps:
+        return 0
+    rows = [
+        AgentStep(
+            message_id=message_id,
+            task_id=task_id,
+            step_index=int(s.get("step_index", 0)),
+            step_type=str(s.get("step_type", "unknown"))[:20],
+            tool_name=s.get("tool_name"),
+            tool_call_id=s.get("tool_call_id"),
+            tool_args=s.get("tool_args"),
+            tool_result=s.get("tool_result"),
+            error=s.get("error"),
+        )
+        for s in steps
+    ]
+    session.add_all(rows)
+    await session.flush()
+    return len(rows)

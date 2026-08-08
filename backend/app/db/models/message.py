@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from ulid import ULID
 
@@ -47,6 +47,8 @@ class Message(Base):
     duration_sec: Mapped[Optional[float]] = mapped_column(Numeric(8, 2), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ok")
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 这次生成 LLM 实际调了几次工具（汇总指标）。agent_steps 表存每步明细。
+    tool_calls: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

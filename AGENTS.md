@@ -37,7 +37,7 @@ cd backend && uvicorn app.main:app --reload
 cd frontend && npm run dev
 
 # 测试
-cd backend && python -m pytest -q    # 96 passed
+cd backend && python -m pytest -q    # 107 passed
 
 # 类型检查
 cd frontend && ./node_modules/.bin/tsc --noEmit

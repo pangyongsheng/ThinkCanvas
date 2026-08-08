@@ -19,8 +19,8 @@
 │       + 1 个 few-shot（冒泡排序）            │
 ├──────────────────────────────────────────────┤
 │  Layer 2: Few-shot Examples（动态加载）       │
-│  ⚠️ shared/prompts/examples/ 当前是空目录     │
-│  v1.0 唯一例子直接嵌在 system prompt 里      │
+│  已废弃（目录保留为空）                       │
+│  v1.0 起改为 few_shots 表 + embedding 检索    │
 ├──────────────────────────────────────────────┤
 │  Layer 3: User Prompt (原始)                 │
 │  用户输入 + 上一次错误（重试时）             │
@@ -45,8 +45,8 @@
 | 算法 | 状态 | 位置 |
 |---|---|---|
 | 冒泡排序 | ✅ | 嵌在 system prompt 里 |
-| 二分查找 | ❌ 待补 | `shared/prompts/examples/` 当前空 |
-| 图 BFS | ❌ 待补 | 同上 |
+| 二分查找 | ✅（如需补充） | `few_shots` 表 — 用户用「👍 收藏」按钮自行入库；retriever 按相似度召回 |
+| 图 BFS | ✅（如需补充） | 同上 |
 
 > v1.0 范围要求 3 个算法 few-shot，目前只剩 1 个。补完前 fallback 到"prompt 描述硬性约束 + 1 个排序例子"。
 

@@ -127,6 +127,7 @@ async def generate_stream(
             return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
         from app.db.session import async_session_factory
+        from app.storage import conversations as conv_store
         from app.storage import tasks as task_store
 
         # Step 5: persist every request so /tasks history survives reload.
@@ -138,7 +139,9 @@ async def generate_stream(
             yield _sse("started", {"prompt": prompt, "task_id": task_id})
 
             result = await run_agent(prompt.strip(), style_id=style, max_iterations=8)
-            tool_calls = len(result.get("tool_log", []))
+            tool_log = result.get("tool_log", [])
+            tool_steps = result.get("tool_steps", [])
+            tool_calls = len(tool_log)
             code = result.get("code")
 
             if not code:
@@ -151,6 +154,9 @@ async def generate_stream(
                         status="failed",
                         error="agent failed to produce code",
                         tool_calls=tool_calls,
+                    )
+                    await conv_store.write_agent_steps(
+                        session, task_id=task_id, steps=tool_steps,
                     )
                 yield _sse(
                     "failed",
@@ -181,6 +187,9 @@ async def generate_stream(
                         duration_sec=render_result.duration_sec,
                         tool_calls=tool_calls,
                     )
+                    await conv_store.write_agent_steps(
+                        session, task_id=task_id, steps=tool_steps,
+                    )
                 yield _sse(
                     "failed",
                     {"error": render_result.error or "render failed", "task_id": task_id},
@@ -199,6 +208,9 @@ async def generate_stream(
                     duration_sec=render_result.duration_sec,
                     tool_calls=tool_calls,
                     clear_error=True,
+                )
+                await conv_store.write_agent_steps(
+                    session, task_id=task_id, steps=tool_steps,
                 )
             yield _sse(
                 "done",
