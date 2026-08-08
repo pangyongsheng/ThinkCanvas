@@ -3,11 +3,31 @@
 import { useState } from "react";
 import { MessageRecord } from "@/lib/api";
 
+/** 单条步骤日志，对应后端一次 SSE 事件。 */
+type StepKind =
+  | "thinking"
+  | "tool_call"
+  | "tool_result"
+  | "retry"
+  | "code"
+  | "rendering"
+  | "failed";
+
+export type Step = {
+  id: string;
+  kind: StepKind;
+  label: string;
+  status?: "ok" | "failed";
+  error?: string;
+};
+
 interface Props {
   messages: MessageRecord[];
   busy: boolean;
   /** Latest status pill text shown at the top of the panel. */
   status?: string;
+  /** 实时步骤流（SSE 事件拼成的日志）。busy=false 后保留显示直到下次新请求。 */
+  steps?: Step[];
   /** Called when the user submits the bottom input box. */
   onSend: (instruction: string) => void;
   /** Called when the user clicks "👍 收藏为范例" on an assistant bubble. */
@@ -30,6 +50,7 @@ export function ConversationPanel({
   messages,
   busy,
   status,
+  steps,
   onSend,
   onSaveAsFewShot,
   disabled,
@@ -68,11 +89,21 @@ export function ConversationPanel({
             onSaveAsFewShot={m.role === "assistant" ? onSaveAsFewShot : undefined}
           />
         ))}
-        {busy && (
-          <div className="flex justify-start">
-            <div className="max-w-[80%] rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-xs text-gray-300">
-              ⏳ 正在调整…
+        {steps && steps.length > 0 && (
+          <div className="rounded-lg border border-gray-800 bg-gray-950/60 p-2 text-xs text-gray-400">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="font-medium text-gray-300">
+                {busy ? "正在生成…" : "上次步骤"}
+              </span>
             </div>
+            <ul className="space-y-0.5">
+              {steps.map((s) => (
+                <li key={s.id} className="flex items-start gap-1.5">
+                  <span className="shrink-0">{stepIcon(s)}</span>
+                  <span className={stepLabelClass(s)}>{s.label}</span>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </div>
@@ -106,6 +137,25 @@ export function ConversationPanel({
       </div>
     </aside>
   );
+}
+
+function stepIcon(s: Step): string {
+  if (s.kind === "tool_call") {
+    if (s.status === "failed") return "✗";
+    if (s.status === "ok") return "✓";
+    return "…";
+  }
+  if (s.kind === "retry") return "⟳";
+  if (s.kind === "code") return "✓";
+  if (s.kind === "rendering") return "…";
+  if (s.kind === "failed") return "✗";
+  return "•";
+}
+
+function stepLabelClass(s: Step): string {
+  if (s.status === "failed" || s.kind === "failed") return "text-red-300";
+  if (s.kind === "code") return "text-green-300";
+  return "text-gray-400";
 }
 
 function Bubble({

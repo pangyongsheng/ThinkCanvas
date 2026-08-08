@@ -7,6 +7,7 @@ remain in place for chronological display but with those columns cleared.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
@@ -78,15 +79,6 @@ def _delete_video_files(video_urls: list[str]) -> int:
         except OSError as exc:
             logger.warning("delete_video_files.skip path=%s err=%s", path, exc)
     return deleted
-
-
-
-    """First non-empty line, trimmed, max ``limit`` chars."""
-    for line in text.splitlines():
-        cleaned = line.strip()
-        if cleaned:
-            return cleaned[:limit]
-    return text.strip()[:limit]
 
 
 async def create_conversation(
@@ -230,7 +222,7 @@ async def list_user_messages(
     return [content for content in rows if content]
 
 
-def _append_user_message_sync(session, conversation_id: str, content: str) -> Optional[Message]:
+def _append_user_message_sync(session, conversation_id: str, content: str) -> Message:
     """Sync core — same logic as the async wrapper, for unit tests."""
     msg = Message(
         conversation_id=conversation_id,
@@ -247,7 +239,7 @@ async def append_user_message(
     session: AsyncSession,
     conversation_id: str,
     content: str,
-) -> Optional[Message]:
+) -> Message:
     msg = Message(conversation_id=conversation_id, role="user", content=content.strip())
     session.add(msg)
     await session.commit()
@@ -267,7 +259,7 @@ def _write_assistant_message_sync(
     duration_sec: Optional[float] = None,
     error: Optional[str] = None,
     tool_calls: Optional[int] = None,
-) -> Optional[Message]:
+) -> Message:
     """Sync core — see ``write_assistant_message`` for full docstring."""
     stmt = select(Message).where(
         Message.conversation_id == conversation_id,
@@ -316,7 +308,7 @@ async def write_assistant_message(
     duration_sec: Optional[float] = None,
     error: Optional[str] = None,
     tool_calls: Optional[int] = None,
-) -> Optional[Message]:
+) -> Message:
     """Insert the assistant's latest turn.
 
     Clears ``code``/``video_url`` on any prior assistant row for this
@@ -424,6 +416,17 @@ __all__ = [
 
 
 
+
+
+def _serialize_tool_args(value) -> str | None:
+    """dict / list / None → JSON 字符串（落 agent_steps.tool_args 用）。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
 async def write_agent_steps(
     session: AsyncSession,
     *,
@@ -450,7 +453,9 @@ async def write_agent_steps(
             step_type=str(s.get("step_type", "unknown"))[:20],
             tool_name=s.get("tool_name"),
             tool_call_id=s.get("tool_call_id"),
-            tool_args=s.get("tool_args"),
+            # tool_args 列是 Text/JSONB-friendly 字符串 — dict 必须先序列化。
+            # （原 agent_recovery 里 _truncate_dict 返回 dict，需要 json.dumps）
+            tool_args=_serialize_tool_args(s.get("tool_args")),
             tool_result=s.get("tool_result"),
             error=s.get("error"),
         )

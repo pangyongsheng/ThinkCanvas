@@ -78,6 +78,7 @@ async def run_refine(
     max_iterations: int = 4,
     user_history: list[str] | None = None,
     few_shots: Sequence[FewShot] = (),
+    on_event=None,
 ) -> dict:
     """构建一次性 agent，按 ``instruction`` 重写 ``prev_code``。
 
@@ -114,6 +115,7 @@ async def run_refine(
         max_iterations=max_iterations,
         label="agent.refine",
         style_id=style_id,
+        on_event=on_event,
     )
     logger.info(
         "agent.refine end code=%s tool_calls=%d",

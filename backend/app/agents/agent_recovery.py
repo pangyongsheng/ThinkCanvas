@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.agents.schemas import CodeOutput
@@ -40,6 +41,7 @@ async def invoke_with_recovery(
     label: str,
     style_id: str,
     callbacks: list | None = None,
+    on_event: OnEvent = None,
 ) -> dict:
     """调用 ``agent.ainvoke`` 并通过多层兜底链恢复代码。
 
@@ -60,6 +62,10 @@ async def invoke_with_recovery(
 
     last_result = None
     for attempt in range(2):  # original + 1 retry
+        await _safe_emit(
+            on_event, "thinking",
+            {"step": "calling_llm", "attempt": attempt + 1},
+        )
         try:
             result = await agent.ainvoke(invoke_input, config=config)
         except Exception:
@@ -75,6 +81,10 @@ async def invoke_with_recovery(
         if not _looks_truncated(result):
             break
         if attempt == 0:
+            await _safe_emit(
+                on_event, "retry",
+                {"reason": "truncated", "attempt": 2},
+            )
             logger.warning(
                 "%s.truncated_retry style=%s — output looks truncated; "
                 "retrying once",
@@ -83,12 +93,53 @@ async def invoke_with_recovery(
 
     if last_result is None:
         raise RuntimeError(f"{label}: ainvoke returned no result")
-    return extract_from_result(last_result, label=label, style_id=style_id)
+    final = extract_from_result(last_result, label=label, style_id=style_id)
+    # 重放 tool 事件：每个 tool_call step 带 tool_result 字段时，紧跟一条 tool_result。
+    # 用户看到 SSE 流时，这些事件出现在 code 事件之前。
+    if on_event is not None:
+        for step in final.get("tool_steps", []):
+            if step.get("step_type") != "tool_call":
+                continue
+            await _safe_emit(
+                on_event, "tool_call",
+                {"tool": step.get("tool_name")},
+            )
+            if step.get("tool_result") is not None or step.get("error") is not None:
+                err = step.get("error")
+                await _safe_emit(
+                    on_event, "tool_result",
+                    {
+                        "tool": step.get("tool_name"),
+                        "status": "failed" if err else "ok",
+                        "error": err,
+                    },
+                )
+    return final
 
 
 # ---------------------------------------------------------------------------
 # Per-result extraction
 # ---------------------------------------------------------------------------
+
+OnEvent = Callable[[str, dict], Awaitable[None]] | None
+
+
+async def _safe_emit(
+    on_event: OnEvent,
+    event: str,
+    data: dict,
+) -> None:
+    """Emit an SSE-style event via callback; swallow errors.
+
+    on_event 抛错不能影响 agent 跑 — 观测通道绝不能反向污染主流程。
+    """
+    if on_event is None:
+        return
+    try:
+        await on_event(event, data)
+    except Exception:
+        log_exception(logger, f"on_event {event} failed (swallowed)")
+
 
 def _looks_truncated(result: dict) -> bool:
     """判断 LLM 输出是否疑似截断。
@@ -211,11 +262,12 @@ def extract_from_result(result: dict, *, label: str, style_id: str) -> dict:
         if msg_type == "ToolMessage":
             tc_id = getattr(msg, "tool_call_id", None)
             content = getattr(msg, "content", "")
-            status = getattr(msg, "status", "ok")
+            status = getattr(msg, "status", "success")
             result_text = str(content)[:4000]
+            is_error = status == "error"
             if tc_id and tc_id in pending_calls:
                 pending_calls[tc_id]["tool_result"] = result_text
-                if status != "ok":
+                if is_error:
                     pending_calls[tc_id]["error"] = result_text
             else:
                 # 孤儿 ToolMessage（没匹配到 AIMessage.tool_call），单独落一条
@@ -226,7 +278,7 @@ def extract_from_result(result: dict, *, label: str, style_id: str) -> dict:
                     "tool_call_id": tc_id,
                     "tool_args": None,
                     "tool_result": result_text,
-                    "error": None if status == "ok" else result_text,
+                    "error": result_text if is_error else None,
                 })
 
     logger.info(

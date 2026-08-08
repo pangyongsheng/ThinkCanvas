@@ -230,10 +230,10 @@ export async function createConversation(
   prompt: string,
   style: StyleId = "3b1b",
 ): Promise<CreateConversationResult> {
-  return fetchJson<CreateConversationResult>("/api/v1/conversations", {
-    method: "POST",
-    body: JSON.stringify({ prompt, style }),
-  });
+  // SSE 流式：POST /conversations 现在返 event-stream。
+  // 这里简化用法：不传 handlers，只等 done 事件拿结果。
+  const sub = subscribeCreateConversation(prompt, style, {});
+  return sub.result;
 }
 
 export async function listConversations(limit = 50): Promise<ConversationRecord[]> {
@@ -291,6 +291,14 @@ export async function listFewShots(
 export interface RefineStreamHandlers {
   started?: (data: { conversation_id: string; user_message_id: string }) => void;
   generating?: (data: { instruction: string }) => void;
+  /** Agent 每次调 LLM 前发一条。 */
+  thinking?: (data: { step: string; attempt: number }) => void;
+  /** Agent 每次调工具（validate_manim_code / render_manim_dryrun）前发一条。 */
+  toolCall?: (data: { tool: string }) => void;
+  /** 工具返回后发一条，status 区分 ok / failed。 */
+  toolResult?: (data: { tool: string; status: "ok" | "failed"; error?: string }) => void;
+  /** invoke_with_recovery 触发 1-shot 重试时发一条（罕见）。 */
+  retry?: (data: { reason: string; attempt: number; error?: string }) => void;
   code?: (data: { code: string; scene_name: string }) => void;
   rendering?: (data: { scene_name?: string }) => void;
   done?: (data: {
@@ -304,6 +312,115 @@ export interface RefineStreamHandlers {
     tool_calls?: number;
     last_message?: string;
   }) => void;
+}
+
+/** POST /conversations 流式（SSE）handlers — 与 RefineStreamHandlers 共用同一组步骤事件。 */
+export type CreateStreamHandlers = Omit<
+  RefineStreamHandlers,
+  "started" | "generating" | "done"
+> & {
+  started?: (data: { conversation_id: string }) => void;
+  done?: (data: CreateConversationResult) => void;
+};
+
+/** 后端事件名 → 前端 handler 名（snake_case → camelCase） */
+const EVENT_TO_HANDLER: Record<string, string> = {
+  tool_call: "toolCall",
+  tool_result: "toolResult",
+};
+
+function resolveHandlerName(eventName: string): string {
+  return EVENT_TO_HANDLER[eventName] ?? eventName;
+}
+
+/**
+ * POST /conversations 改 SSE 流式后用这个订阅。返回 unsubscribe + 一个 Promise：
+ * Promise 在收到 ``done`` 事件时 resolve（payload 跟旧 ``createConversation`` 返回值一致），
+ * 收到 ``failed`` 或网络错误时 reject。
+ */
+export function subscribeCreateConversation(
+  prompt: string,
+  style: StyleId,
+  handlers: CreateStreamHandlers,
+): { unsubscribe: () => void; result: Promise<CreateConversationResult> } {
+  const controller = new AbortController();
+  const url = `${BACKEND_URL}/api/v1/conversations`;
+
+  const result = new Promise<CreateConversationResult>((resolve, reject) => {
+    (async () => {
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-User-Id": getOrCreateUserId(),
+          },
+          body: JSON.stringify({ prompt, style }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        handlers.failed?.({ error: String(err) });
+        reject(err);
+        return;
+      }
+      if (!res.ok || !res.body) {
+        const errMsg = `HTTP ${res.status}`;
+        handlers.failed?.({ error: errMsg });
+        reject(new Error(errMsg));
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      try {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          let frameEnd: number;
+          while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
+            const frame = buffer.slice(0, frameEnd);
+            buffer = buffer.slice(frameEnd + 2);
+            const lines = frame.split("\n");
+            let eventName = "message";
+            let data = "";
+            for (const line of lines) {
+              if (line.startsWith("event:")) eventName = line.slice(6).trim();
+              else if (line.startsWith("data:")) data += line.slice(5).trim();
+            }
+            if (!data) continue;
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            const fn = (handlers as Record<string, ((d: unknown) => void) | undefined>)[
+              resolveHandlerName(eventName)
+            ];
+            if (fn) fn(parsed);
+            if (eventName === "done") {
+              resolve(parsed as CreateConversationResult);
+              return;
+            }
+            if (eventName === "failed") {
+              reject(new Error(((parsed as { error?: string })?.error) ?? "failed"));
+              return;
+            }
+          }
+        }
+      } catch (err) {
+        handlers.failed?.({ error: String(err) });
+        reject(err);
+      }
+    })();
+  });
+
+  return {
+    unsubscribe: () => controller.abort(),
+    result,
+  };
 }
 
 export function subscribeRefine(
@@ -362,7 +479,9 @@ export function subscribeRefine(
           else if (line.startsWith("data:")) data += line.slice(5).trim();
         }
         if (!data) continue;
-        const fn = (handlers as Record<string, ((d: unknown) => void) | undefined>)[eventName];
+        const fn = (handlers as Record<string, ((d: unknown) => void) | undefined>)[
+          resolveHandlerName(eventName)
+        ];
         if (!fn) continue;
         try {
           fn(JSON.parse(data));

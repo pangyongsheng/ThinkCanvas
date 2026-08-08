@@ -10,6 +10,7 @@ import {
   createConversation,
   getConversation,
   saveAsFewShot,
+  subscribeCreateConversation,
   subscribeRefine,
 } from "@/lib/api";
 
@@ -19,9 +20,78 @@ import { ConversationPanel } from "@/components/ConversationPanel";
 
 type Status = "idle" | "creating" | "generating" | "rendering" | "done" | "failed";
 
+/** 单条步骤日志条目，对应后端一次 SSE 事件。 */
+type Step = {
+  id: string;
+  kind: "thinking" | "tool_call" | "tool_result" | "retry" | "code" | "rendering" | "failed";
+  label: string;
+  status?: "ok" | "failed";
+  error?: string;
+};
+
+/** 工具名 → 友好中文。 */
+function prettyTool(name: string): string {
+  if (name === "validate_manim_code") return "校验代码";
+  if (name === "render_manim_dryrun") return "试渲染";
+  return name;
+}
+
 // Tiny helper to mint stable-but-temp ids for optimistic messages.
 function tempId(prefix: string): string {
   return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** 把后端步骤事件转成 Step[] 更新器，给 handleCreateFirst 和 handleRefine 共用。 */
+function buildStepHandlers(
+  setSteps: (updater: (prev: Step[]) => Step[]) => void,
+  setStatusLabel: (s: string) => void,
+) {
+  const push = (s: Step) => setSteps((prev) => [...prev, s]);
+  const updateLast = (
+    predicate: (s: Step) => boolean,
+    patch: Partial<Step>,
+  ) => setSteps((prev) => {
+    for (let i = prev.length - 1; i >= 0; i--) {
+      if (predicate(prev[i])) {
+        const copy = prev.slice();
+        copy[i] = { ...copy[i], ...patch };
+        return copy;
+      }
+    }
+    return prev;
+  });
+  return {
+    thinking: (d: { step: string; attempt: number }) => {
+      push({ id: tempId("step"), kind: "thinking", label: `调用模型（第 ${d.attempt} 次）` });
+      setStatusLabel("思考中…");
+    },
+    toolCall: (d: { tool: string }) => {
+      push({ id: tempId("step"), kind: "tool_call", label: `调用 ${prettyTool(d.tool)}` });
+      setStatusLabel("校验中…");
+    },
+    toolResult: (d: { tool: string; status: "ok" | "failed"; error?: string }) => {
+      updateLast(
+        (s) => s.kind === "tool_call" && !s.status,
+        { status: d.status, error: d.error },
+      );
+      if (d.status === "failed") {
+        setStatusLabel("校验未通过，正在重写…");
+      }
+    },
+    retry: (d: { reason: string; attempt: number }) => {
+      push({ id: tempId("step"), kind: "retry", label: `重试（第 ${d.attempt} 次：${d.reason}）` });
+    },
+    code: () => {
+      push({ id: tempId("step"), kind: "code", label: "代码生成完成" });
+      setStatusLabel("正在编译视频…");
+    },
+    rendering: () => {
+      push({ id: tempId("step"), kind: "rendering", label: "正在编译视频…" });
+    },
+    failed: (d: { error: string }) => {
+      push({ id: tempId("step"), kind: "failed", label: `❌ ${d.error}` });
+    },
+  };
 }
 
 export default function Page() {
@@ -31,6 +101,8 @@ export default function Page() {
   const [statusLabel, setStatusLabel] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [style, setStyle] = useState<StyleId>("3b1b");
+  /** 步骤日志：每次新请求（创建 / refine）开始前清空。 */
+  const [steps, setSteps] = useState<Step[]>([]);
 
   // sidebar refresh trigger — bumped after any successful op
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
@@ -58,6 +130,7 @@ export default function Page() {
     setError(null);
     setStatus("idle");
     setStatusLabel("");
+    setSteps([]);
   }
 
   function handleNew() {
@@ -141,21 +214,32 @@ export default function Page() {
     };
     setActiveConversation(optimistic);
 
-    try {
-      const created = await createConversation(prompt, style);
-      const fresh = await getConversation(created.conversation.id);
-      setActiveConversation(fresh);
-      setStatus("done");
-      setStatusLabel("完成");
-      setHistoryRefreshKey((k) => k + 1);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setStatus("failed");
-      setStatusLabel("失败");
-      setActiveConversation(null);
-      return;
-    }
+    setSteps([]);
+    const stepHandlers = buildStepHandlers(setSteps, setStatusLabel);
 
+    const sub = subscribeCreateConversation(
+      prompt,
+      style,
+      {
+        ...stepHandlers,
+        started: () => setStatusLabel("开始生成…"),
+        done: async (created) => {
+          const fresh = await getConversation(created.conversation.id);
+          setActiveConversation(fresh);
+          setStatus("done");
+          setStatusLabel("完成");
+          setHistoryRefreshKey((k) => k + 1);
+        },
+        failed: (d) => {
+          stepHandlers.failed?.(d);
+          setStatus("failed");
+          setStatusLabel("失败");
+          setError(d.error ?? "未知错误");
+        },
+      },
+    );
+    abortRef.current = sub.unsubscribe;
+    return sub.result;
   }
 
   async function handleRefine(instruction: string) {
@@ -184,11 +268,13 @@ export default function Page() {
     );
 
     const idAtSubscribe = activeConversation.id;
+    setSteps([]);
+    const stepHandlers = buildStepHandlers(setSteps, setStatusLabel);
 
     abortRef.current = subscribeRefine(idAtSubscribe, instruction, {
+      ...stepHandlers,
       started: () => setStatusLabel("开始调整…"),
       generating: () => setStatusLabel("调用模型…"),
-      code: () => setStatusLabel("渲染中…"),
       rendering: () => setStatus("rendering"),
       done: async () => {
         const fresh = await getConversation(idAtSubscribe);
@@ -199,6 +285,7 @@ export default function Page() {
         setHistoryRefreshKey((k) => k + 1);
       },
       failed: (d) => {
+        stepHandlers.failed?.(d);
         setStatus("failed");
         setStatusLabel("失败");
         setError(d.error ?? "未知错误");
@@ -239,10 +326,10 @@ export default function Page() {
         messages={activeConversation?.messages ?? []}
         busy={busy}
         status={statusLabel}
+        steps={steps}
         onSend={handleSend}
         onSaveAsFewShot={handleSaveAsFewShot}
         disabled={busy}
-        // Empty conversation: show a welcoming placeholder.
         placeholder={
           activeConversation
             ? "还想调整什么？例如：把背景换成白色"

@@ -143,3 +143,120 @@ async def test_normal_structured_response_still_works():
     assert result["code"].rstrip() == RUNNABLE_CODE.rstrip()
     assert result["code"].startswith("from manim import *")
     assert "TrapezoidArea(Scene)" in result["code"]
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_recovery_emits_on_event():
+    """invoke_with_recovery should emit thinking + tool events via on_event callback."""
+    from app.agents.agent_recovery import invoke_with_recovery
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    # mock 一个 agent：返回包含 tool_call + tool_result 的消息
+    fake_agent = MagicMock()
+
+    async def _fake_ainvoke(*_args, **_kwargs):
+        return {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"id": "call_1", "name": "validate_manim_code", "args": {"code": "x"}},
+                    ],
+                ),
+                ToolMessage(content="ok", tool_call_id="call_1"),
+                AIMessage(content="done"),
+            ],
+            "structured_response": None,
+        }
+
+    fake_agent.ainvoke = _fake_ainvoke
+
+    # 抓事件
+    events: list[tuple[str, dict]] = []
+
+    async def on_event(event: str, data: dict) -> None:
+        events.append((event, data))
+
+    result = await invoke_with_recovery(
+        fake_agent,
+        {"messages": []},
+        max_iterations=4,
+        label="test",
+        style_id="3b1b",
+        on_event=on_event,
+    )
+
+    kinds = [e[0] for e in events]
+    assert "thinking" in kinds, f"expected thinking event, got {kinds}"
+    assert "tool_call" in kinds, f"expected tool_call event, got {kinds}"
+    assert "tool_result" in kinds, f"expected tool_result event, got {kinds}"
+
+    # tool_call data 应包含 tool name
+    tool_call_data = next(d for e, d in events if e == "tool_call")
+    assert tool_call_data["tool"] == "validate_manim_code"
+
+    # tool_result data 应包含 status
+    tool_result_data = next(d for e, d in events if e == "tool_result")
+    assert tool_result_data["status"] == "ok"
+    assert tool_result_data["tool"] == "validate_manim_code"
+
+    # thinking 事件应在 ainvoke 之前发出
+    assert kinds[0] == "thinking"
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_recovery_no_callback_unchanged():
+    """不传 on_event 时行为应该跟以前一模一样 —— 无 callback。"""
+    from app.agents.agent_recovery import invoke_with_recovery
+    from langchain_core.messages import AIMessage
+
+    fake_agent = MagicMock()
+
+    async def _fake_ainvoke(*_args, **_kwargs):
+        return {
+            "messages": [AIMessage(content="hello")],
+            "structured_response": None,
+        }
+
+    fake_agent.ainvoke = _fake_ainvoke
+
+    # 不传 on_event 也不应该报错
+    result = await invoke_with_recovery(
+        fake_agent,
+        {"messages": []},
+        max_iterations=4,
+        label="test",
+        style_id="3b1b",
+    )
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_recovery_swallows_callback_errors():
+    """callback 抛错不能影响主流程。"""
+    from app.agents.agent_recovery import invoke_with_recovery
+    from langchain_core.messages import AIMessage
+
+    fake_agent = MagicMock()
+
+    async def _fake_ainvoke(*_args, **_kwargs):
+        return {
+            "messages": [AIMessage(content="hello")],
+            "structured_response": None,
+        }
+
+    fake_agent.ainvoke = _fake_ainvoke
+
+    async def bad_on_event(event: str, data: dict) -> None:
+        raise RuntimeError("callback intentionally broken")
+
+    # 不应该抛
+    result = await invoke_with_recovery(
+        fake_agent,
+        {"messages": []},
+        max_iterations=4,
+        label="test",
+        style_id="3b1b",
+        on_event=bad_on_event,
+    )
+    assert result is not None

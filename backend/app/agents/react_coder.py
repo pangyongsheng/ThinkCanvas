@@ -28,6 +28,7 @@ async def run_agent(
     style_id: str = DEFAULT_STYLE_ID,
     max_iterations: int = 6,
     few_shots: Sequence[FewShot] = (),
+    on_event=None,
 ) -> dict:
     """构建并调用标准的 LangChain agent。
 
@@ -47,6 +48,7 @@ async def run_agent(
         max_iterations=max_iterations,
         label="agent.run",
         style_id=style_id,
+        on_event=on_event,
     )
     return result
 
