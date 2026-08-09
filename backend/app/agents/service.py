@@ -22,6 +22,7 @@ from typing import Sequence
 from langchain_core.messages import HumanMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.agent_recovery import invoke_with_recovery
 from app.agents.builder import build_agent
 from app.agents.dao.agent_steps import AgentStepsDAO
 from app.agents.dao.conversations import ConversationsDAO
@@ -95,6 +96,7 @@ class AgentService:
             on_event=on_event,
             prompt_text=prompt.strip(),
             conversation_id=conv.id,
+            label="agent.run_initial",
         )
         assistant = _require_message("run_initial", assistant_msg, conv.id)
         return AgentRunResult(
@@ -133,6 +135,7 @@ class AgentService:
             prompt_text=prompt_text,
             conversation_id=conversation_id,
             extra_system_prompt=_REFINE_PREAMBLE,
+            label="agent.run_refine",
         )
         conv = await self.dao_conv.get(conversation_id, user_id=user_id)
         if conv is None:
@@ -205,8 +208,15 @@ class AgentService:
         prompt_text: str,
         conversation_id: str,
         extra_system_prompt: str = "",
+        label: str = "agent.run",
     ) -> Message | None:
-        """构造 agent → 跑 ainvoke → 拿回 middleware 创建的 assistant 消息。
+        """构造 agent → 跑 ``invoke_with_recovery`` → 拿回 middleware 创建的 assistant 消息。
+
+        **必须**走 ``invoke_with_recovery`` 而非直接 ``agent.ainvoke`` —— 后者
+        没有任何兜底，refine prompt 长 / LLM 把代码写到 thinking 块里时
+        ``state["structured_response"]`` 经常为 None，4 层恢复链一个都用不上。
+        ``invoke_with_recovery`` 在 ainvoke 之外再做 text-block / aggressive scan /
+        python fence / 1-shot retry 的兜底，是 refine 路径能稳定出图的根。
 
         同一份 DAO 实例复用，避免每次新建 middleware 时再造一份 DAO。
         """
@@ -220,14 +230,32 @@ class AgentService:
             few_shots=list(few_shots),
             middleware=[middleware],
         )
-        await agent.ainvoke(
+        recovered = await invoke_with_recovery(
+            agent,
             {"messages": [HumanMessage(content=prompt_text)]},
+            max_iterations=8,
+            label=label,
+            style_id=style,
             context={
                 "conversation_id": conversation_id,
                 "on_event": on_event,
             },
         )
-        return await self._get_assistant_after_agent(conversation_id)
+        recovered_code: str | None = recovered.get("code") if recovered else None
+
+        # middleware 的 ``aafter_agent`` 已经按 ``state["structured_response"]``
+        # 写过一次 assistant 行。如果有 recovered code，需要再写一次把它从
+        # ``status=failed`` 翻成 ``status=ok`` 并补 scene_name。
+        assistant_msg = await self._get_assistant_after_agent(conversation_id)
+        if recovered_code and assistant_msg is not None:
+            await self.dao_msg.finalize_after_agent(
+                message_id=assistant_msg.id,
+                code=recovered_code,
+                scene_name=_extract_scene_name(recovered_code),
+                status="ok",
+            )
+            await self.session.refresh(assistant_msg)
+        return assistant_msg
 
     async def _get_assistant_after_agent(
         self, conversation_id: str,

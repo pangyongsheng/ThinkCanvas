@@ -34,6 +34,8 @@ interface Props {
   onSend: (instruction: string) => void;
   /** Called when the user clicks "👍 收藏为范例" on an assistant bubble. */
   onSaveAsFewShot?: (message: MessageRecord) => void;
+  /** Called when the user clicks "↻ 重试" on a failed bubble. */
+  onRetry?: (instruction: string) => void;
   /** Disable input (used during refine generation). */
   disabled?: boolean;
   /** Default: "还想调整什么？例如：把背景换成白色" */
@@ -55,6 +57,7 @@ export function ConversationPanel({
   steps,
   onSend,
   onSaveAsFewShot,
+  onRetry,
   disabled,
   placeholder,
 }: Props) {
@@ -89,6 +92,7 @@ export function ConversationPanel({
             key={m.id}
             m={m}
             onSaveAsFewShot={m.role === "assistant" ? onSaveAsFewShot : undefined}
+            onRetry={m.role === "assistant" ? onRetry : undefined}
           />
         ))}
         {steps && steps.length > 0 && (
@@ -163,9 +167,11 @@ function stepLabelClass(s: Step): string {
 function Bubble({
   m,
   onSaveAsFewShot,
+  onRetry,
 }: {
-  m: MessageRecord;
+  m: MessageRecord & { retryInstruction?: string | null };
   onSaveAsFewShot?: (m: MessageRecord) => void;
+  onRetry?: (instruction: string) => void;
 }) {
   if (m.role === "user") {
     return (
@@ -205,8 +211,36 @@ function Bubble({
             👍 收藏为范例
           </button>
         )}
+        {m.status === "failed" && onRetry && (
+          <RetryButton m={m} onRetry={onRetry} />
+        )}
         <div className="mt-1 text-[10px] opacity-60">{fmtTime(m.created_at)}</div>
       </div>
     </div>
+  );
+}
+
+
+/** "↻ 重试" — replays the instruction that produced this failure. */
+function RetryButton({
+  m,
+  onRetry,
+}: {
+  m: MessageRecord & { retryInstruction?: string | null };
+  onRetry: (instruction: string) => void;
+}) {
+  // Prefer the instruction captured at failure time; fall back to the
+  // bubble content for completeness (failed bubbles don't carry instructions
+  // normally, but the field stays available for future cases).
+  const text = ((m.retryInstruction ?? "") || m.content).trim();
+  return (
+    <button
+      onClick={() => onRetry(text)}
+      disabled={!text}
+      className="mt-2 rounded border border-red-700 bg-red-900/40 px-2 py-0.5 text-[11px] text-red-200 hover:bg-red-800/60 disabled:opacity-50"
+      title="用同一指令再试一次"
+    >
+      ↻ 重试
+    </button>
   );
 }

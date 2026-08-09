@@ -45,7 +45,7 @@ async def test_refine_returns_code_when_structured_response_present():
 
     structured = CodeOutput(thought="tweaked bg", code=RUNNABLE_CODE)
 
-    async def _fake_ainvoke(invoke_input, config=None):
+    async def _fake_ainvoke(invoke_input, config=None, context=None):
         # Capture the input for inspection in assertion below.
         _fake_ainvoke.captured = invoke_input
         return {
@@ -86,7 +86,7 @@ async def test_refine_recovers_code_from_thinking_blocks():
     ]
     fake_agent = MagicMock()
 
-    async def _fake_ainvoke(invoke_input, config=None):
+    async def _fake_ainvoke(invoke_input, config=None, context=None):
         return {
             "messages": [
                 AIMessage(content="adjusting"),
@@ -117,7 +117,7 @@ async def test_refine_includes_user_history_in_prompt():
     fake_agent = MagicMock()
     captured: dict = {}
 
-    async def _fake_ainvoke(invoke_input, config=None):
+    async def _fake_ainvoke(invoke_input, config=None, context=None):
         # Capture the user message so we can assert on its content.
         captured["messages"] = invoke_input["messages"]
         return {
@@ -159,7 +159,7 @@ async def test_refine_omits_history_block_when_empty():
     fake_agent = MagicMock()
     captured: dict = {}
 
-    async def _fake_ainvoke(invoke_input, config=None):
+    async def _fake_ainvoke(invoke_input, config=None, context=None):
         captured["messages"] = invoke_input["messages"]
         return {
             "messages": [AIMessage(content="ok")],
@@ -299,3 +299,57 @@ async def test_refine_retries_when_output_looks_truncated():
     assert call_count["n"] == 2, "should have retried exactly once"
     assert result["code"] is not None
     assert "RetryWin" in result["code"]
+
+
+@pytest.mark.asyncio
+async def test_refine_retries_when_extraction_completely_fails():
+    """当 4 层兜底都没救回 code（不只是 truncated）时，也要 retry。
+
+    这是「成功一次 失败一次」现象的修复：旧逻辑只在 thinking + 空 text
+    这种明显截断时重试；现在只要 extracted.code is None 就 retry，
+    最多 3 次。
+    """
+    garbage_text = AIMessage(content="sorry, I can't help with that")
+
+    fake_agent = MagicMock()
+    call_count = {"n": 0}
+
+    async def _fake_ainvoke(*_args, **_kwargs):
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            return {"messages": [AIMessage(content="refine"), garbage_text], "structured_response": None}
+        real_answer = CodeOutput(
+            thought="ok",
+            code="from manim import *\n\nclass RetryWin2(Scene):\n    def construct(self):\n        pass\n",
+        )
+        return {"messages": [AIMessage(content="ok")], "structured_response": real_answer}
+
+    fake_agent.ainvoke = _fake_ainvoke
+
+    with _patch_build_agent(fake_agent):
+        from app.agents.refine import run_refine
+        result = await run_refine(prev_code="# old\n", instruction="x", style_id="3b1b")
+
+    assert call_count["n"] == 3, f"should have retried until success, got {call_count['n']} attempts"
+    assert result["code"] is not None
+    assert "RetryWin2" in result["code"]
+
+
+@pytest.mark.asyncio
+async def test_refine_gives_up_after_3_attempts():
+    """3 次都救不回 code，就放弃、返回 code=None。"""
+    fake_agent = MagicMock()
+    call_count = {"n": 0}
+
+    async def _fake_ainvoke(*_args, **_kwargs):
+        call_count["n"] += 1
+        return {"messages": [AIMessage(content="nope")], "structured_response": None}
+
+    fake_agent.ainvoke = _fake_ainvoke
+
+    with _patch_build_agent(fake_agent):
+        from app.agents.refine import run_refine
+        result = await run_refine(prev_code="# old\n", instruction="x", style_id="3b1b")
+
+    assert call_count["n"] == 3, f"should give up after 3 attempts, got {call_count['n']}"
+    assert result["code"] is None

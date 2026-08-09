@@ -73,23 +73,27 @@ class MessagesDAO:
     ) -> Message | None:
         """``after_agent`` 钩子调：写入 code + status + scene_name。
 
-        ``code`` 非空 → status="ok"，否则按入参。同一事务里同时清掉旧 assistant
-        行的 code/video_url（保持"最新一份有内容"的语义）。
+        行为：
+          * ``code`` 非空 → ``status="ok"``，并清掉同会话其它 assistant 行的
+            code/video_url/scene_name（"最新一份有内容"语义）。
+          * ``code`` 为空 → ``status="failed"``，**保留**历史成功行的产物
+            ——用户上一轮成功的 code 还在，下一轮 refine 才能基于它继续调整。
         """
         msg = await self.session.get(Message, message_id)
         if msg is None:
             return None
-        # 清掉旧 assistant 行的产物（保持"最新一份有内容"的语义）
-        stmt = select(Message).where(
-            Message.conversation_id == msg.conversation_id,
-            Message.role == "assistant",
-            Message.id != message_id,
-        )
-        for row in (await self.session.execute(stmt)).scalars():
-            row.code = None
-            row.video_url = None
-            row.duration_sec = None
-            row.scene_name = None
+        if code:
+            # 成功：清掉旧 assistant 行的产物（保持"最新一份有内容"的语义）
+            stmt = select(Message).where(
+                Message.conversation_id == msg.conversation_id,
+                Message.role == "assistant",
+                Message.id != message_id,
+            )
+            for row in (await self.session.execute(stmt)).scalars():
+                row.code = None
+                row.video_url = None
+                row.duration_sec = None
+                row.scene_name = None
         msg.code = code
         msg.scene_name = scene_name
         msg.status = status if code else "failed"

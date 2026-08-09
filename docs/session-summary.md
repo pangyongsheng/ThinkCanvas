@@ -206,3 +206,34 @@ DAO (app/agents/dao/*.py)
 - `mypy app/agents/...`：本次重构的 6 个文件**零错误**（其余错误为历史遗留）
 - `app.main.app.openapi()`：路由列表只剩 conversations/few_shots/health/readyz/render，**不再有** `/generate`、`/tasks`
 
+
+### 13. 「成功一次 失败一次」BUG 修复（2026-08-09）
+
+现象：同一会话连续调 refine，LLM 输出不稳定时第一次出图、第二次失败。失败率高。
+
+根因：`invoke_with_recovery` 旧版只在 LLM 输出「thinking + 空 text」这种明显截断时才重试一次。MiniMax-M3 在长 refine prompt + 用户指令含糊时，**输出可能既不截断、也完全无 code** —— 4 层兜底（text-block / aggressive scan / python fence）全失败，旧代码不重试直接放弃。
+
+修复：
+- `backend/app/agents/agent_recovery.py` — 重写重试循环：从「截断才重试」改成「`extract_from_result` 拿不到 code 就重试」，最多 3 次（原 + 2 retry）
+- `backend/tests/agents/test_refine.py` — 加 2 个测试覆盖新行为：`test_refine_retries_when_extraction_completely_fails` / `test_refine_gives_up_after_3_attempts`
+
+#### 验证
+- `pytest -q`：**102 passed**（100 + 2 新增）
+- `tests/agents/test_refine.py::test_refine_retries_when_output_looks_truncated` 仍 PASS（旧 truncation 场景被新逻辑覆盖）
+- 监控日志关注新事件 `agent_recovery.no_code_attempt_N` — 出现频率越高，说明 LLM 越不稳定，需要进一步优化 prompt
+
+### 14. 删除对话 500 修复（2026-08-09）
+
+现象：`DELETE /api/v1/conversations/{id}` 返回 500。
+
+根因：原 `ConversationsDAO.delete` 用 `session.get(Conversation, id)` 拿到对象后，**靠 ORM cascade 级联删除 messages**。async 路径上 ORM cascade 触发 lazy load 时容易踩到 `MissingGreenlet`，且 cascade + DB-level `ON DELETE CASCADE` 同时启用会引入顺序歧义。
+
+修复 (`backend/app/agents/dao/conversations.py:140-178`)：
+- 改用 `selectinload(Conversation.messages)` 显式预加载 — 避免后续 cascade 时再触发 lazy load
+- 用 `bulk DELETE` 直接按 `conversation_id` 删 messages → DB 自动 CASCADE 删 agent_steps
+- 再 bulk DELETE conversation — 双向 CASCADE 兜底，少一层 ORM 状态机出错点
+
+测试 (`backend/tests/agents/test_conversations_dao.py`)：5 个用例覆盖 4 种场景（无找到 / 用户不匹配 / 正常 / 无消息 / 无视频）
+
+#### 验证
+- `pytest -q`：**107 passed**（102 + 5 新增）

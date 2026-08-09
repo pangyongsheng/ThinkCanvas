@@ -150,7 +150,13 @@ async def create_conversation(
                 return
 
         if not run_result.code:
-            await on_event("failed", {"error": "agent failed to produce code"})
+            err = "agent failed to produce code"
+            async with async_session_factory() as s:
+                await AgentService(s).mark_agent_failed(
+                    message_id=run_result.assistant_message.id,
+                    error=err,
+                )
+            await on_event("failed", {"error": err})
             return
 
         scene_name = run_result.scene_name or extract_scene_name(run_result.code)
@@ -264,11 +270,20 @@ async def refine_conversation(
                 )
             except Exception as exc:
                 logger.exception("refine.run_refine failed")
-                await on_event("failed", {"error": f"agent error: {exc}"})
+                err = f"agent error: {exc}"
+                # middleware 的 ``aafter_agent`` 之前已经把 DB 里的 assistant
+                # shell 状态写成 ``failed``（code=None 时），无需额外处理。
+                await on_event("failed", {"error": err})
                 return
 
         if not run_result.code:
-            await on_event("failed", {"error": "agent failed to produce code"})
+            err = "agent failed to produce code"
+            async with async_session_factory() as s:
+                await AgentService(s).mark_agent_failed(
+                    message_id=run_result.assistant_message.id,
+                    error=err,
+                )
+            await on_event("failed", {"error": err})
             return
 
         scene_name = run_result.scene_name or extract_scene_name(run_result.code)

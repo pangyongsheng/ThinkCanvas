@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -141,22 +141,45 @@ class ConversationsDAO:
 
         Best-effort video cleanup. ``user_id`` scopes the delete: a non-owner
         asking to delete gets ``False`` (treated as 404 by HTTP layer).
+
+        实现要点：
+          * 用 SELECT + selectinload 一次性把 messages 拉回来 — 避免后续
+            cascade 时再触发 lazy load（async context + greenlet 边界上
+            可能踩到 ``MissingGreenlet``）
+          * snapshot 视频 URL 后，**用 bulk DELETE** 直接按 conversation_id
+            删 messages + 让 DB CASCADE 删 agent_steps；不再走 ORM 级联
+            删除路径，少一层 ORM 状态机出错点
+          * 先删 messages 再删 conversation — DB FK 双向 CASCADE 都到位，
+            任意一边都能兜底
         """
-        conv = await self.session.get(Conversation, conversation_id)
+        stmt = (
+            select(Conversation)
+            .options(selectinload(Conversation.messages))
+            .where(Conversation.id == conversation_id)
+        )
+        r = await self.session.execute(stmt)
+        conv = r.scalar_one_or_none()
         if conv is None:
             return False
         if user_id is not None and conv.user_id != user_id:
             return False
 
-        # Snapshot video_urls BEFORE cascade wipe — once the session deletes
-        # the conversation, conv.messages is lazy-loaded onto a session
-        # that's about to be invalidated.
+        # Snapshot video_urls BEFORE wipe — 需要 messages 数据
         video_urls = [
             m.video_url for m in conv.messages
             if m.role == "assistant" and m.video_url
         ]
 
-        await self.session.delete(conv)
+        # Bulk delete messages（DB 层 agent_steps.message_id ON DELETE CASCADE
+        # 会自动把 agent_steps 也带走）。conversation 这边等 messages 删完
+        # 再删，避免 ORM 级联 + DB 级联双重删除时顺序歧义。
+        from app.db.models import Message
+        await self.session.execute(
+            sa_delete(Message).where(Message.conversation_id == conversation_id)
+        )
+        await self.session.execute(
+            sa_delete(Conversation).where(Conversation.id == conversation_id)
+        )
         await self.session.commit()
 
         if video_urls:

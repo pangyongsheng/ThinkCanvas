@@ -218,6 +218,29 @@ export default function Page() {
   }
 
 
+
+  /** Push a synthetic assistant bubble explaining the failure + a retry button. */
+  function appendFailedAssistant(errorText: string, retryInstruction: string | null) {
+    const failedMsg: MessageRecord & { retryInstruction?: string | null } = {
+      id: tempId("msg"),
+      role: "assistant",
+      content: "❌ 生成失败",
+      code: null,
+      video_url: null,
+      scene_name: null,
+      duration_sec: null,
+      status: "failed",
+      error: errorText,
+      created_at: new Date().toISOString(),
+      retryInstruction,
+    };
+    setActiveConversation((prev) =>
+      prev
+        ? { ...prev, messages: [...prev.messages, failedMsg] }
+        : prev,
+    );
+  }
+
   async function handleCreateFirst(prompt: string) {
     setStatus("creating");
     setStatusLabel("创建对话 + 首次生成");
@@ -272,6 +295,7 @@ export default function Page() {
           setStatus("failed");
           setStatusLabel("失败");
           setError(d.error ?? "未知错误");
+          appendFailedAssistant(d.error ?? "未知错误", prompt);
         },
       },
     );
@@ -329,6 +353,7 @@ export default function Page() {
         setStatus("failed");
         setStatusLabel("失败");
         setError(d.error ?? "未知错误");
+        appendFailedAssistant(d.error ?? "未知错误", instruction);
       },
     });
   }
@@ -368,6 +393,13 @@ export default function Page() {
         status={statusLabel}
         steps={steps}
         onSend={handleSend}
+        onRetry={(instr) => {
+          // Retry replays the same instruction through the normal send path,
+          // which already short-circuits to handleCreateFirst / handleRefine
+          // depending on whether an active conversation is present.
+          if (!instr) return;
+          void handleSend(instr);
+        }}
         onSaveAsFewShot={handleSaveAsFewShot}
         disabled={busy}
         placeholder={

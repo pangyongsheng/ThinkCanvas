@@ -40,6 +40,7 @@ async def invoke_with_recovery(
     label: str,
     style_id: str,
     callbacks: list | None = None,
+    context: Any = None,
 ) -> dict:
     """调用 ``agent.ainvoke`` 并通过多层兜底链恢复代码。
 
@@ -49,41 +50,55 @@ async def invoke_with_recovery(
       3. 暴力扫描：每个 block 的每个字符串字段都试一次
       4. 任意字符串字段里第一个 ```python 代码栅栏
 
-    整轮重试：
-      如果所有兜底都失败、且最终的 ``text`` 块几乎是空的
-      （< 20 字符），就重试一次。这能救回一种情况：LLM 把预算
-      全烧在 thinking 里，根本没产出真正的答案。
+    整轮重试（最多 3 次）：
+      每次 ainvoke 后立即跑 extract_from_result，如果 ``code`` 拿不到
+      就重试。这能救回多种情况：
+        * LLM 把预算都花在 thinking 里没输出答案
+        * 4 层兜底都救不回的乱码输出（retry 时 LLM 可能换个好答案）
+        * MiniMax-M3 在长 refine prompt 下的不稳定
+
+    ``context`` 必须原样转发给 ``agent.ainvoke`` —— langgraph 1.x 把
+    ``conversation_id`` / ``on_event`` 等挂在 ``Runtime.context`` 上，
+    ``AgentPersistenceMiddleware.abefore_agent`` 依赖这个 context 落库；
+    漏传会让 middleware 抛 ``ValueError("conversation_id is required")``。
     """
     config = {"recursion_limit": max_iterations * 4 + 1}  # type: ignore[dict-item]
     if callbacks:
         config["callbacks"] = callbacks  # type: ignore[dict-item]
 
-    last_result = None
-    for attempt in range(2):  # original + 1 retry
+    MAX_ATTEMPTS = 3  # original + 2 retries
+    last_extracted: dict | None = None
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            result = await agent.ainvoke(invoke_input, config=config)
+            result = await agent.ainvoke(invoke_input, config=config, context=context)
         except Exception:
-            if attempt == 0:
+            if attempt < MAX_ATTEMPTS - 1:
                 logger.warning(
-                    "%s.ainvoke_error style=%s — retrying once",
-                    label, style_id,
+                    "%s.ainvoke_error style=%s — retrying (%d/%d)",
+                    label, style_id, attempt + 1, MAX_ATTEMPTS - 1,
                 )
                 continue
-            log_exception(logger, f"{label} ainvoke failed (after retry)")
+            log_exception(logger, f"{label} ainvoke failed (after %d retries)" % (MAX_ATTEMPTS - 1,))
             raise
-        last_result = result
-        if not _looks_truncated(result):
-            break
-        if attempt == 0:
+
+        extracted = extract_from_result(result, label=label, style_id=style_id)
+        if extracted.get("code"):
+            if attempt > 0:
+                logger.info(
+                    "%s.recovered_after_retry style=%s attempt=%d code_len=%d",
+                    label, style_id, attempt + 1, len(extracted["code"]),
+                )
+            return extracted
+
+        # extraction failed — retry if attempts remain
+        last_extracted = extracted
+        if attempt < MAX_ATTEMPTS - 1:
             logger.warning(
-                "%s.truncated_retry style=%s — output looks truncated; "
-                "retrying once",
-                label, style_id,
+                "%s.no_code_attempt_%d style=%s — retrying",
+                label, attempt + 1, style_id,
             )
 
-    if last_result is None:
-        raise RuntimeError(f"{label}: ainvoke returned no result")
-    return extract_from_result(last_result, label=label, style_id=style_id)
+    return last_extracted or {"code": None, "messages": []}
 
 
 # ---------------------------------------------------------------------------

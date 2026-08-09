@@ -86,7 +86,8 @@ class AgentPersistenceMiddleware(AgentMiddleware):
         if not conversation_id:
             raise ValueError(
                 "AgentPersistenceMiddleware.before_agent: "
-                "runtime.context['conversation_id'] is required"
+                "runtime.context['conversation_id'] is required, "
+                f"got runtime.context={ctx!r}"
             )
 
         msg = await self.dao_messages.create_assistant_shell(
