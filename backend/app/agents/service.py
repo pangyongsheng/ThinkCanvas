@@ -23,10 +23,13 @@ from langchain_core.messages import HumanMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.agent_recovery import invoke_with_recovery
+from app.agents.algorithm_extractor import extract_algorithm_name
 from app.agents.builder import build_agent
 from app.agents.dao.agent_steps import AgentStepsDAO
 from app.agents.dao.conversations import ConversationsDAO
 from app.agents.dao.messages import MessagesDAO
+from app.agents.memory import build_memory_block
+from app.agents.memory_curator import MemoryCurator, MemoryEvent
 from app.agents.middleware.persistence import AgentPersistenceMiddleware
 from app.db.models import Conversation, FewShot, Message
 
@@ -95,6 +98,7 @@ class AgentService:
             few_shots=few_shots,
             on_event=on_event,
             prompt_text=prompt.strip(),
+            user_id=user_id,
             conversation_id=conv.id,
             label="agent.run_initial",
         )
@@ -133,6 +137,7 @@ class AgentService:
             few_shots=few_shots,
             on_event=on_event,
             prompt_text=prompt_text,
+            user_id=user_id,
             conversation_id=conversation_id,
             extra_system_prompt=_REFINE_PREAMBLE,
             label="agent.run_refine",
@@ -206,6 +211,7 @@ class AgentService:
         few_shots: Sequence[FewShot],
         on_event: OnEvent,
         prompt_text: str,
+        user_id: str,
         conversation_id: str,
         extra_system_prompt: str = "",
         label: str = "agent.run",
@@ -219,14 +225,27 @@ class AgentService:
         python fence / 1-shot retry 的兜底，是 refine 路径能稳定出图的根。
 
         同一份 DAO 实例复用，避免每次新建 middleware 时再造一份 DAO。
+
+        **长期记忆集成**：先 ``build_memory_block`` 拿用户偏好 + 历史 + 反馈，
+        拼到 ``extra_system_prompt`` 末尾；agent 跑完后异步调
+        ``extract_algorithm_name`` 把这次的算法名写回 user_algorithm_history。
         """
+        # 拼 system prompt 的记忆块（空数据时自动空字符串）
+        memory_block = await build_memory_block(
+            self.session, user_id=user_id,
+        )
+        full_extra_prompt = (
+            extra_system_prompt
+            + ("\n\n" + memory_block if memory_block else "")
+        )
+
         middleware = AgentPersistenceMiddleware(
             dao_steps=self.dao_steps,
             dao_messages=self.dao_msg,
         )
         agent = build_agent(
             style_id=style,
-            extra_system_prompt=extra_system_prompt,
+            extra_system_prompt=full_extra_prompt,
             few_shots=list(few_shots),
             middleware=[middleware],
         )
@@ -255,7 +274,158 @@ class AgentService:
                 status="ok",
             )
             await self.session.refresh(assistant_msg)
+
+        # 后台：触发 MemoryCurator 分析这次事件，提炼出 user_memories。
+        # 失败只丢一条记忆，不影响主流程。
+        self._schedule_memory_curator(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=assistant_msg.id if assistant_msg else None,
+            user_prompt=prompt_text,
+            code=recovered_code,
+            status="ok" if recovered_code else "failed",
+        )
         return assistant_msg
+
+    def _schedule_memory_curator(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        message_id: str | None,
+        user_prompt: str,
+        code: str | None,
+        status: str,
+    ) -> None:
+        """Fire-and-forget 把这次生成作为事件丢给 MemoryCurator。
+
+        Curator 会读 user 的现有 memories + 这次事件，调 LLM 输出
+        add / reinforce / update / remove patch，应用到 user_memories。
+
+        任一异常只 log —— 后台任务不应该让请求报错。
+        """
+        import asyncio
+        from app.db.session import async_session_factory
+
+        if not message_id:
+            return
+
+        async def _runner() -> None:
+            try:
+                summary = (
+                    f"用户请求：{user_prompt[:300]}\n"
+                    f"agent 生成代码（前 800 字）："
+                    + (code or "")[:800]
+                    + f"\n本次结果：{status}"
+                )
+                event = MemoryEvent(
+                    kind="generation",
+                    summary=summary,
+                    extra={
+                        "conversation_id": conversation_id,
+                        "message_id": message_id,
+                        "status": status,
+                    },
+                )
+                async with async_session_factory() as s:
+                    curator = MemoryCurator(s)
+                    n = await curator.process(event, user_id=user_id)
+                logger.info(
+                    "service.curator_invoked user=%s msg=%s actions=%d",
+                    user_id, message_id, n,
+                )
+            except Exception:
+                logger.exception("service.curator_failed user=%s", user_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_runner())
+        except RuntimeError:
+            asyncio.run(_runner())
+
+    def schedule_feedback_curator(
+        self,
+        *,
+        user_id: str,
+        message_id: str,
+        verdict: str,
+        note: str | None = None,
+        user_prompt: str = "",
+        code: str = "",
+    ) -> None:
+        """公开方法 — 路由层调（POST /feedback 后）。"""
+        import asyncio
+        from app.db.session import async_session_factory
+
+        async def _runner() -> None:
+            try:
+                summary = (
+                    f"用户对 assistant message 给了反馈：verdict={verdict}。"
+                    + (f" 注释：{note}" if note else "")
+                    + (f"\n对应用户请求：{user_prompt[:200]}" if user_prompt else "")
+                    + (f"\n对应生成代码（前 400 字）：{code[:400]}" if code else "")
+                )
+                event = MemoryEvent(
+                    kind="feedback",
+                    summary=summary,
+                    extra={
+                        "message_id": message_id,
+                        "verdict": verdict,
+                    },
+                )
+                async with async_session_factory() as s:
+                    curator = MemoryCurator(s)
+                    n = await curator.process(event, user_id=user_id)
+                logger.info(
+                    "service.feedback_curator user=%s msg=%s verdict=%s actions=%d",
+                    user_id, message_id, verdict, n,
+                )
+            except Exception:
+                logger.exception("service.feedback_curator_failed user=%s", user_id)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_runner())
+        except RuntimeError:
+            asyncio.run(_runner())
+
+    def schedule_preference_curator(
+        self,
+        *,
+        user_id: str,
+        changed_fields: dict[str, str | None],
+    ) -> None:
+        """公开方法 — 路由层调（PUT /preferences 后）。"""
+        import asyncio
+        from app.db.session import async_session_factory
+
+        async def _runner() -> None:
+            try:
+                summary = (
+                    f"用户更新了偏好：{changed_fields}"
+                )
+                event = MemoryEvent(
+                    kind="preference",
+                    summary=summary,
+                    extra={"changed_fields": changed_fields},
+                )
+                async with async_session_factory() as s:
+                    curator = MemoryCurator(s)
+                    n = await curator.process(event, user_id=user_id)
+                logger.info(
+                    "service.preference_curator user=%s actions=%d",
+                    user_id, n,
+                )
+            except Exception:
+                logger.exception(
+                    "service.preference_curator_failed user=%s", user_id,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_runner())
+        except RuntimeError:
+            asyncio.run(_runner())
 
     async def _get_assistant_after_agent(
         self, conversation_id: str,

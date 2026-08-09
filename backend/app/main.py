@@ -15,6 +15,7 @@ from app.api.v1.readyz import router as readyz_router
 from app.api.v1.render import router as render_router
 from app.api.v1.conversations import router as conversations_router
 from app.api.v1.few_shots import router as few_shots_router
+from app.api.v1.preferences import router as preferences_router
 from app.config import get_settings, project_root
 from app.core.logging import configure_logging, install_fastapi_exception_logger
 
@@ -85,6 +86,7 @@ def create_app() -> FastAPI:
     app.include_router(render_router, prefix=settings.api_v1_prefix)
     app.include_router(conversations_router, prefix=settings.api_v1_prefix)
     app.include_router(few_shots_router, prefix=settings.api_v1_prefix)
+    app.include_router(preferences_router, prefix=settings.api_v1_prefix)
 
     # Static: serve generated videos
     media_dir = project_root / "media"

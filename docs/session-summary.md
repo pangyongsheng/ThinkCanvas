@@ -237,3 +237,143 @@ DAO (app/agents/dao/*.py)
 
 #### 验证
 - `pytest -q`：**107 passed**（102 + 5 新增）
+
+### 15. 长期记忆 / 用户档案（2026-08-09）
+
+让 agent 跨会话记住用户：偏好（语言 / 默认风格 / 自定义说明）+ 算法历史（做过什么）+ 反馈（👍/👎）。新会话开局时把这段塞进 system prompt。
+
+#### 新增
+
+**ORM models** (`backend/app/db/models/`)
+- `user_preference.py` — 1:1 挂 users，存 language / default_style / extra_instructions
+- `user_algorithm_history.py` — user × algorithm 去重轨迹，`UNIQUE(user_id, algorithm_name)` + embedding 用于相似度合并
+- `user_feedback.py` — 用户对 assistant message 的 verdict (liked/disliked) + note
+
+**DAO 层** (`backend/app/agents/dao/`)
+- `user_preferences.py` — `UserPreferencesDAO`（get / upsert / reset）用 sentinel 默认区分"没传"和"传 None 清空"
+- `user_algorithm_history.py` — `UserAlgorithmHistoryDAO`（`upsert_by_name` 走 `INSERT ... ON CONFLICT DO UPDATE`，`list_recent` / `merge_into`）
+- `user_feedback.py` — `UserFeedbackDAO`（write / list_recent / get_latest_for_message）
+
+**Memory 层** (`backend/app/agents/`)
+- `memory.py` — `build_memory_block(session, user_id)` 召回偏好+历史+反馈，拼成可塞 system prompt 的 markdown 段；空数据自动空字符串
+- `algorithm_extractor.py` — 一次轻量 LLM 调用抽 (algorithm_name, embedding)；失败回落到 "general"，绝不抛
+
+**Service 集成** (`backend/app/agents/service.py`)
+- `_run_agent` 加 `user_id` 参数 → `build_memory_block` 拼到 `extra_system_prompt` 末尾
+- 跑完后 `_schedule_algorithm_capture` fire-and-forget：开新 session，调 extractor，upsert 到 history
+
+**API 层** (`backend/app/api/v1/preferences.py`)
+- `GET /api/v1/preferences` — 读偏好
+- `PUT /api/v1/preferences` — 部分字段 upsert
+- `DELETE /api/v1/preferences` — 重置（幂等）
+- `POST /api/v1/feedback` — 写一条 👍/👎，message_id 校验防横向越权
+
+**Migration** (`backend/alembic/versions/20260809_add_user_memory.py`)
+- 3 张新表 + 索引 + UNIQUE 约束
+- 顺带把 alembic_version.version_num 放宽到 VARCHAR(64)
+
+#### 测试
+
+- `tests/agents/test_user_memory_dao.py` — 9 个 DAO 用例（sentinel 默认、upsert 合并、reset 边界）
+- `tests/agents/test_memory.py` — 9 个拼装用例（空数据 / 单段 / 全段 / 字段跳过）
+- `tests/agents/test_algorithm_extractor.py` — 7 个解析 + fallback 用例（JSON / fence / 错误输入）
+
+`pytest -q`：**132 passed**（107 + 25 新增）
+
+#### 数据流
+
+```
+新会话
+  POST /conversations
+    ↓
+  AgentService.run_initial
+    ├─ build_memory_block 召回偏好 + 历史 + 反馈
+    ├─ 拼到 system prompt 末尾
+    ├─ build_agent + invoke_with_recovery
+    └─ 后台 task: extract_algorithm_name → upsert_by_name
+
+用户 👍/👎
+  POST /feedback { message_id, verdict, note }
+    ↓
+  UserFeedbackDAO.write 落库，下次会话时被 memory.py 召回
+```
+
+### 16. 长期记忆 v2 — LLM-curated memories（2026-08-09）
+
+**取代 v1 的简单表拼接**（v1 把 user_algorithm_history / user_feedback / user_preferences 原样塞 prompt，太糙）。
+
+v2 架构：
+
+```
+原始事件                          curator (LLM)                user_memories
+─────────────────                ─────────────                ────────────────
+generation (prompt+code+status)   ─┐
+feedback (liked/disliked+note)     ├→  读现有 memories + 事件      add / reinforce /
+preference (用户改的语言等)        ┘   调 LLM 输出 JSON patch  ─→  update / remove
+```
+
+**新表 `user_memories`**（替换 v1 三个表直接喂 prompt 的角色）：
+
+```
+user_memories (
+  id, user_id, category (preference/pattern/avoidance/style_hint),
+  insight TEXT,            -- LLM 提炼的一句话洞察
+  confidence FLOAT,        -- 0~1，多次 reinforce 后升高（封顶 1.0）
+  evidence_count INT,      -- 多少事件支持这个洞察
+  superseded_by_id,        -- 被新洞察覆盖时旧行指针
+  status (active/decayed), -- decayed = curator 判定不再成立
+  created_at, last_reinforced_at
+)
+```
+
+**MemoryCurator** (`backend/app/agents/memory_curator.py`)
+
+- 输入：MemoryEvent（kind=generation/feedback/preference + summary + extra）
+- 流程：list_all_active → 拼 user_msg → 调 LLM（OpenAI JSON 模式） → parse actions → apply patch
+- patch types：add / reinforce / update / remove，每种对应 DAO 一个方法
+- 失败兜底：LLM 异常 / JSON parse 失败 / 任何 action 异常都只 log，不抛
+
+**Prompt 拼接 (`memory.py` v2)**
+
+- 只读 `user_memories.list_active(user_id)`，按 confidence × recency 倒序取前 15 条
+- 按 category 分 4 段（用户偏好 / 用户行为模式 / 应避免的事 / 风格提示）
+- 空数据返回空字符串，不污染 prompt
+
+**Service 集成 (`backend/app/agents/service.py`)**
+
+- `_run_agent` 末尾：`_schedule_memory_curator` —— fire-and-forget task，开新 session，调 curator
+- 公开 `schedule_feedback_curator` / `schedule_preference_curator` —— 路由层在 POST /feedback 和 PUT /preferences 末尾调
+
+**API**
+
+- 新增 `GET /api/v1/memories` —— 调试用，返回当前用户的 active memories 列表
+- `POST /api/v1/feedback` 末尾自动调 curator
+- `PUT /api/v1/preferences` 末尾自动调 curator
+
+**新增文件**
+
+- `backend/app/db/models/user_memory.py` — ORM + CATEGORIES 常量
+- `backend/app/agents/dao/user_memories.py` — DAO（list_active / add / reinforce / update_insight / remove）
+- `backend/app/agents/memory_curator.py` — LLM curator
+- `backend/alembic/versions/20260809_add_user_memories.py` — migration
+- `tests/agents/test_user_memories_dao.py` — 7 个 DAO 用例
+- `tests/agents/test_memory_curator.py` — 12 个 curator 用例（parse / format / apply）
+
+**修改**
+
+- `backend/app/agents/memory.py` — 重写为只读 user_memories，按 category 分段
+- `backend/app/agents/service.py` — `_schedule_algorithm_capture` → `_schedule_memory_curator` + 暴露 feedback/preference curator hooks
+- `backend/app/api/v1/preferences.py` — PUT/POST 末尾调 curator；新增 GET /memories
+- `tests/agents/test_memory.py` — 重写为 4 个新测试
+
+**验证**
+
+- `pytest -q`：**146 passed**（132 + 14 新增 / 重写）
+- 路由：`/api/v1/memories` 已注册
+
+**用户验证方式**
+
+1. 重启后端（应用 migration）
+2. 跑几次生成（每次都会触发 generation event → curator 加 memory）
+3. `curl http://localhost:8000/api/v1/memories -H "X-User-Id: <你的id>"` 看 curator 提炼了什么
+4. 给条 👎 + 注释，看下次会话 prompt 里出现对应 avoidance 类 memory
