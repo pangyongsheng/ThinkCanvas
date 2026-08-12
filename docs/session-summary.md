@@ -696,3 +696,108 @@ RuntimeError → 500。
 - `test_run_initial_default_phase_scripting` — 默认 phase 验证
 
 **验证**：`pytest -q` → **179 passed**（176 + 3）
+
+## 22. P3 handlePick 漏恢复 pendingScript — 历史"脚本待确认"会话看着像卡死
+
+**症状**：用户在左侧列表点开 `phase="scripting"` 的历史会话（之前
+出过脚本、没确认的），前端显示**空白 CodeViewer**，半小时像"卡死"。
+实际上脚本一直都在库里，只是前端没显示出来。
+
+**根因**：双层缺字段
+- 后端 `ConversationDetailOut`（`app/api/v1/conversations.py:73`）只
+  序列化 id/title/style/version/messages，**没带 `phase` 和 `current_script`**
+- 前端 `ConversationDetail` 类型没这俩字段，`handlePick` 加载完后只能
+  当"已完成"会话显示 → CodeViewer 空白 → 用户看着像挂了
+
+**修复**（极简，3 处）：
+- `backend/app/api/v1/conversations.py`
+  - `ConversationOut` 加 `phase: str = "coding"`
+  - `ConversationDetailOut` 加 `current_script: dict | None = None`
+  - `_conv_to_out` 把 `c.phase` 带上
+- `frontend/lib/api.ts`
+  - `ConversationRecord` 加 `phase: string`
+  - `ConversationDetail` 加 `current_script?: ScriptDraft | null`
+- `frontend/app/page.tsx`
+  - `handleCreateFirst` 的 optimistic 对象补 `phase/current_script`
+    字段（不然 TS 编译不过）
+  - `handlePick` 加载完后：如果 `detail.phase === "scripting" &&
+    detail.current_script` → `setPendingScript` + `setStatus("script_ready")`，
+    ScriptReviewPanel 重新挂出来让用户继续确认
+
+**验证**：
+- `tsc --noEmit` 通过
+- `pytest -q` → **179 passed**
+
+**用户操作**：浏览器 Cmd+Shift+R 硬刷新前端，再点历史会话，脚本面板
+会重新挂出来。点「确认并生成」走 POST /confirm 即可继续。
+
+## 23. confirm 500 — `_route_after_reviewer` 返了 dict，LangGraph 直接炸
+
+**症状**：用户在脚本面板点「确认并生成」→ 后端 `POST /confirm` 500，
+traceback 末尾：
+
+```
+File ".../langgraph/graph/_branch.py", line 203, in _finish
+    r if isinstance(r, Send) else self.ends[r] for r in result
+                                  ~~~~~~~~~^^^
+TypeError: cannot use 'dict' as a dict key (unhashable type: 'dict')
+During task with name 'reviewer' ...
+```
+
+**根因**：`_route_after_reviewer`（`app/agents/supervisor.py:246`）
+函数签名是 `Literal["coder", "__end__"]`，但**失败分支最后 `return`
+写成了 state update dict**：
+
+```python
+return {"previous_feedback": review.feedback or "...", "code_round": ...}
+```
+
+LangGraph 把 router 的返回值当 `ends` dict 的 key 用，dict 不可 hash
+→ TypeError。这是上次 P2 加 Reviewer�Coder 循环时埋的。
+
+**修复**（极简，2 处）：
+- `app/agents/supervisor.py::_reviewer_node` — 不通过时直接写
+  `previous_feedback` 到 state update（reviewer node 的本职）
+- `app/agents/supervisor.py::_route_after_reviewer` — 只返 `"coder"`
+  或 `"__end__"`，不再返 dict
+
+**新增 3 个回归测试**（`tests/agents/test_supervisor.py`）：
+- `test_route_after_reviewer_never_returns_dict` — 6 个 state 组合
+  全部断言返回值是 `str` 且 ∈ {`"coder"`, `"__end__"}`
+- `test_reviewer_node_writes_previous_feedback_on_failure` — 失败时
+  state update 里有 `previous_feedback`
+- `test_reviewer_node_no_previous_feedback_on_success` — 通过时不污染
+
+**验证**：
+- `pytest -q` → **182 passed**（179 + 3）
+
+## 24. confirm 半小时没视频 — handler 漏渲染 + attach_video
+
+**症状**：脚本面板点「确认并生成」→ 后端 200 OK 返回 `{code, scene_name}`，
+前端跳"脚本已确认，生成完成" → 左侧 CodeViewer 显示「视频还没渲染好」半小时。
+Network 面板 confirm 200 但 video_url 永远 null。
+
+**根因**：`POST /conversations/{id}/confirm` handler（`app/api/v1/conversations.py:240`）
+只跑了 agent、返了 `{code, scene_name, conversation_id}` 就结束，**没调
+`render_code`、没 `attach_video`**。前端 `handleConfirmScript` 紧跟着
+`getConversation(cid)` 重新拉的 fresh 里 assistant.video_url 仍然是 null
+（middleware finalize 时只填 code，video 还得路由层写）。
+
+**修复**：跟 `create_conversation` 同款 5 步走：
+- 提取 `scene_name`（fallback 到 `extract_scene_name(code)`）
+- `await render_code(code, scene_name)`
+- 失败 → `mark_render_failed` + 抛 500
+- 成功 → `to_video_url(path)` + `attach_video(message_id, video_url, duration)`
+- 响应里多带 `video_url` + `duration_sec`，前端 `ConfirmConversationResult` 类型同步加
+
+**前端**：`lib/api.ts` `ConfirmConversationResult` 加 `video_url?` / `duration_sec?`
+（`handleConfirmScript` 不用改 — 它后面还会 `getConversation` 重新拉，attach
+后 fresh 已经有 video_url 了）。
+
+**新增 4 个回归测试**（`tests/api/test_confirm_renders.py`）：
+- `test_confirm_calls_render_code` — handler 必须调 render_code
+- `test_confirm_calls_attach_video` — 必须 attach_video
+- `test_confirm_returns_video_url` — 响应带 video_url
+- `test_confirm_marks_render_failed_on_error` — 渲染失败必须 mark_render_failed
+
+**验证**：`pytest -q` → **186 passed**（182 + 4）

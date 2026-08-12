@@ -217,3 +217,68 @@ def test_resolve_on_event_returns_none_when_missing():
     state = {}
     runtime = _FakeRuntime(None)
     assert _resolve_on_event(state, runtime) is None
+
+
+# ---------------------------------------------------------------------------
+# P3 review router 必须只返 string — 之前返 dict 让 LangGraph 炸
+# ---------------------------------------------------------------------------
+
+def test_route_after_reviewer_never_returns_dict():
+    """回归保护：router 在任何 state 组合下都不能返 dict / list。
+
+    LangGraph 的 conditional edge 拿 router 返回值当 ends 表的 key，
+    dict 不可 hash → TypeError: cannot use 'dict' as a dict key。
+    """
+    from app.agents.supervisor import _route_after_reviewer
+
+    cases = [
+        {},
+        {"review": None},
+        {"review": CodeReview(ok=True, feedback="")},
+        {"review": CodeReview(ok=False, feedback="x"), "code_round": 0},
+        {"review": CodeReview(ok=False, feedback="x"), "code_round": MAX_CODE_ROUNDS},
+        {"review": CodeReview(ok=False, feedback="x"), "code_round": MAX_CODE_ROUNDS + 1},
+    ]
+    for state in cases:
+        r = _route_after_reviewer(state)
+        assert isinstance(r, str), (
+            f"router returned {type(r).__name__} for state={state!r}: {r!r}"
+        )
+        assert r in ("coder", "__end__"), f"unexpected return: {r!r}"
+
+
+def test_reviewer_node_writes_previous_feedback_on_failure():
+    """Reviewer 不通过时必须把 feedback 写进 state（之前是 router 写的，
+    现在搬到 node 里了 — 这条测试保证不会再退回 router）。"""
+    import asyncio
+    from app.agents.supervisor import _reviewer_node
+
+    failing_review = CodeReview(ok=False, feedback="颜色不对")
+    async def fake_ainvoke(messages):
+        return failing_review
+    with patch("app.agents.supervisor.build_reviewer_llm") as llm_factory:
+        llm_factory.return_value = MagicMock(ainvoke=fake_ainvoke)
+        update = asyncio.run(_reviewer_node({
+            "code": "x=1",
+            "review": None,
+        }))
+    assert update["review"] is failing_review
+    assert update["previous_feedback"] == "颜色不对"
+
+
+def test_reviewer_node_no_previous_feedback_on_success():
+    """通过时不能污染 previous_feedback（否则下一轮会读到旧反馈）。"""
+    import asyncio
+    from app.agents.supervisor import _reviewer_node
+
+    ok_review = CodeReview(ok=True, feedback="通过")
+    async def fake_ainvoke(messages):
+        return ok_review
+    with patch("app.agents.supervisor.build_reviewer_llm") as llm_factory:
+        llm_factory.return_value = MagicMock(ainvoke=fake_ainvoke)
+        update = asyncio.run(_reviewer_node({
+            "code": "x=1",
+            "review": None,
+        }))
+    assert update["review"] is ok_review
+    assert "previous_feedback" not in update

@@ -1,220 +1,267 @@
 # 02 · 系统架构
 
-> 反映 v1.0 实际状态。所有路径、组件、命令以仓库代码为准。
+> 反映 v1.0 **当前**实际状态（2026-08 更新）。所有路径、组件、命令以仓库代码为准。
+>
+> 关键演进：v1.0 早期是"标准 `create_agent` + 单 agent + SSE 流"，v1.0 P2 起升级为 **LangGraph `StateGraph` Supervisor**（Coder ↔ Reviewer + 入口分诊 + Script Designer），并加了**长期记忆 / Memory Curator / 持久化中间件**。
 
-## 🏗 整体架构（v1.0 现状）
+## 🏗 整体架构（v1.0 当前）
 
 ```
-┌──────────┐    ┌──────────┐    ┌──────────┐
-│  Browser │───▶│  Next.js │───▶│  FastAPI │
-│  (用户)  │◀───│  Web UI  │◀───│  Backend │◀──▶ Postgres
-└──────────┘    └──────────┘    └────┬─────┘
-      ▲               ▲               │
-      │               │               │ SSE（实时进度）
-      │               └───────────────┘
+┌──────────┐    ┌──────────┐    ┌──────────────┐
+│  Browser │───▶│  Next.js │───▶│   FastAPI    │───▶ Postgres
+│  (用户)  │◀───│  Web UI  │◀───│   Backend    │◀──▶ (conversations
+└──────────┘    └──────────┘    └──────┬───────┘     /messages/
+      ▲               ▲                │              agent_steps/
+      │               │                │              few_shots/
+      │  SSE 实时进度  │ 静态文件       │              user_preferences/
+      │               │  /media/*      │              user_algorithm_history/
+      │               └────────────────│              user_memories)
       │                                │
-      │            渲染完返回视频 URL   ▼
-      └────────── 静态文件 ◀──── /media/* (FastAPI StaticFiles)
-                                   │
-                                   ▼
-                            ┌──────────┐
-                            │  Manim   │
-                            │ Renderer │ (subprocess，in-process)
-                            └──────────┘
+      │                                ▼
+      │                         ┌──────────────┐
+      │                         │  Supervisor  │  LangGraph StateGraph
+      │                         │   StateGraph │  ┌─ entry_router
+      │                         └──────┬───────┘  ├─ script_decision
+      │                                │          ├─ script_designer
+      │                                ▼          └─ coder ↔ reviewer
+      │                         ┌──────────────┐
+      │                         │  LangChain   │  create_agent + middleware
+      │                         │   Agent      │  ├─ AgentPersistenceMiddleware
+      │                         └──────┬───────┘  └─ 工具: validate / render_dryrun
+      │                                │
+      │                                ▼
+      │                         ┌──────────────┐
+      │                         │  MiniMax-M3  │ via langchain-litellm
+      │                         └──────────────┘
+      │
+      │
+      ▼
+   /media/*  ←  Manim 渲染产物（FastAPI StaticFiles）
 ```
 
-**关键变化（vs 原规划）**：
-- ❌ ~~Redis + RQ Worker 异步队列~~ — **未实现**；当前所有渲染在 API 进程内同步执行
-- ❌ ~~WebSocket 推送进度~~ — **改用 SSE**（`GET /api/v1/generate/stream`）
-- ✅ MiniMax-M3 作为默认 LLM（不是 DeepSeek）
-- ✅ **2026-08 升级**：标准 LangChain 1.x `create_agent` + LiteLLM 适配层（手写 loop 已删除）
+## 🔄 数据流（v1.0 当前 — 端到端）
 
-## 🔄 数据流（端到端）
+### 首次生成（`POST /conversations`）
 
 ```
-[1] 用户输入 "冒泡排序"
+[1] 用户输入 prompt（前端 8000 等 style）
    ↓
-[2] 前端 POST /api/v1/render { prompt, quality }
+[2] 前端 POST /api/v1/conversations (SSE)
+   ↓
+[3] FastAPI 路由处理
+   ├─ _resolve_user_id（X-User-Id 中间件）
+   ├─ few-shot 召回（retriever，pgvector + BGE）
+   ├─ 长期记忆块拼装（user_preferences + user_algorithm_history + user_memories + feedbacks）
+   ├─ AgentService.run_initial(phase=scripting)
+   │   ├─ 创建 conversation + user message
+   │   ├─ AgentPersistenceMiddleware.before_agent 建 assistant 壳
+   │   ├─ Supervisor.ainvoke(phase=scripting)
+   │   │   ├─ entry_router → script_decision
+   │   │   ├─ script_decision → script_designer (LLM 决策 need_script)
+   │   │   ├─ need_script=true → script_designer 出 SceneScript JSON
+   │   │   │                  → __end__（等用户确认）
+   │   │   └─ need_script=false → coder（直接生成代码）
+   │   ├─ Middleware 自动落 agent_steps + finalize assistant message
+   │   └─ Memory Curator 异步：分析本次 run，写入 user_memories
    │
-   ▼
-[3] FastAPI 同步执行
-   ├─ CoderAgent.run_streaming(prompt)
-   │   ├─ LLM 生成代码（MiniMax-M3，结构化 JSON 输出）
-   │   ├─ validate_only_retry（最多 N 次）
-   │   ├─ SSE 推送 {"stage": "coding", "attempt": 1}
-   │   └─ SSE 推送 {"stage": "validated"}
-   ├─ 写代码到 tmp/{task_id}.py
-   ├─ subprocess.run(['manim', ...], timeout=60)
-   ├─ 读产物 video.mp4 → 落 media/{task_id}.mp4
-   └─ SSE 推送 {"stage": "done", "video_url": "/media/{task_id}.mp4"}
+   ├─ phase=scripting → SSE 推 script_ready + done（前端弹脚本面板）
+   └─ phase=coding → 渲染（render_code）→ SSE 推 done（前端显示视频）
+```
+
+### 脚本确认（`POST /conversations/{id}/confirm`）
+
+```
+[1] 用户点「确认并生成」
    ↓
-[4] 前端 EventSource 收到 done → 渲染 <video>
+[2] 前端 POST /api/v1/conversations/{id}/confirm (同步)
+   ↓
+[3] FastAPI
+   ├─ AgentService.run_after_confirm(phase=coding)
+   │   ├─ 校验 conv.phase == "scripting"
+   │   ├─ set_phase(coding)
+   │   ├─ Supervisor.ainvoke(phase=coding)
+   │   │   ├─ entry_router → coder（跳过 script_decision / designer）
+   │   │   └─ coder ↔ reviewer 循环直到 reviewer.ok 或 code_round >= MAX
+   │   └─ middleware finalize
+   ├─ render_code → to_video_url
+   ├─ attach_video(message_id, video_url, duration_sec)
+   └─ 响应 {code, scene_name, video_url, duration_sec, conversation_id}
 ```
 
-**注意**：API 在渲染期间会**阻塞**当前请求（60s 超时上限）。这是已知简化，未来拆 Worker。
-
-## 💻 技术栈
-
-### 前端
-| 技术 | 版本 | 状态 |
-|---|---|---|
-| **Next.js** | 15（App Router） | ✅ |
-| TypeScript | 5+ | ✅ |
-| Tailwind CSS | 3+ | ✅ |
-| **SSE 订阅**（`EventSource`） | — | ✅ 替代原计划的 WebSocket |
-
-### 后端
-| 技术 | 版本 | 状态 |
-|---|---|---|
-| **Python** | 3.14（conda 环境 `my-manim-environment`） | ✅ |
-| **FastAPI** | latest | ✅ |
-| uvicorn | latest | ✅ |
-| Pydantic | 2+ | ✅ |
-| SQLAlchemy + Alembic | 2+ | ⚠️ 库在，业务未启用 |
-| **langchain-openai** | latest | ✅（接 MiniMax OpenAI 兼容 API） |
-
-### LLM
-| 角色 | 模型 | 提供方 | 状态 |
-|---|---|---|---|
-| **默认** | **MiniMax-M3** | MiniMax（OpenAI 兼容 API） | ✅ |
-| 备胎 | DeepSeek-V3 / Qwen2.5-Coder | — | 🔜 留切换位 |
-
-> ~~MiniMax 不支持 `tool_calls`~~ → **2026-08 已解决**：通过 `langchain-litellm.ChatLiteLLM`（库内嵌归一化），业务层用标准 `langchain_openai.ChatOpenAI` + `langchain.agents.create_agent` 全套写法。换厂商只改 `app/llm/client.py` 一个文件。
-> 详见 [docs/session-summary.md](session-summary.md#session-2-litellm-适配层--标准-langchain-1x-重构2026-08-06)。
-
-### 渲染
-| 技术 | 用途 | 状态 |
-|---|---|---|
-| **ManimCE** | 动画引擎 | ✅ |
-| **subprocess** | 沙箱 | ✅（v0.2 计划升级 Docker） |
-| ffmpeg | 视频编码 | ✅ |
-| 60s timeout | 资源保护 | ✅ |
-
-### 基础设施
-| 组件 | 状态 |
-|---|---|
-| Docker (Postgres + Redis) | ✅ 起了，**Redis 未接业务** |
-| 本地文件存储 `./media/` | ✅，通过 `/media` 静态挂载 |
-| 阿里云 OSS / S3 | ❌ 未做 |
-
-## 🧱 实际模块结构（与代码一致）
+### 多轮调整（`POST /conversations/{id}/refine`）
 
 ```
-backend/
-├── app/
-│   ├── main.py                       # FastAPI 入口
-│   ├── config.py                     # 读项目根 .env；model_name="MiniMax-M3"
-│   ├── agents/
-│   │   ├── tools.py                  # @tool 装饰的 validate_manim_code / render_manim_dryrun（被 builder.py 装载，是活的核心）
-│   │   ├── builder.py                # LangChain create_agent 工厂 + @lru_cache（活的核心）
-│   │   ├── state.py                  # CodeOutput Pydantic schema（response_format 用）
-│   │   ├── styles.py                 # 3 个 style 注册（academic / 3b1b / minimal）
-│   │   ├── react_coder.py            # run_agent + _invoke_and_extract：run_agent 给 /generate 路径；_invoke_and_extract 还被 refine 复用（活的核心）
-│   │   └── refine.py                 # refine mode：拼装 prev_code + instruction，再调一次 create_agent
-│   ├── api/v1/
-│   │   ├── generate.py               # POST /generate, GET /generate/stream (前端调用中，生产路径之一), POST /generate/agent (死)
-│   │   ├── conversations.py          # POST /conversations, GET /conversations, POST /conversations/{id}/refine (SSE), DELETE /conversations/{id} ＋ conversation + message 双表存储
-│   │   ├── tasks.py                  # 老 task CRUD，暂留作为历史 (Step 5 后废弃)
-│   │   ├── render.py                 # POST /render
-│   │   ├── health.py                 # GET /health
-│   │   └── readyz.py                 # GET /readyz
-│   ├── renderers/
-│   │   └── manim.py                  # subprocess + 60s 超时
-│   ├── tools/validator.py            # AST + 危险模式 + Scene 子类检查
-│   ├── llm/client.py                 # ChatOpenAI 配 MiniMax base_url
-│   └── core/
-│       └── ...                       # 预留扩展
-├── tests/agents/
-│   └── test_coder.py                 # 4/4 测试通过
-├── pyproject.toml
-└── .env.example
+[1] 用户输入调整指令
+   ↓
+[2] 前端 POST /api/v1/conversations/{id}/refine (SSE)
+   ↓
+[3] FastAPI
+   ├─ 追加 user message
+   ├─ AgentService.run_refine
+   │   ├─ _build_refine_prompt（[历史用户指令 cap 6] + [上一版完整代码] + [本次用户调整]）
+   │   ├─ Supervisor.ainvoke(phase=coding)
+   │   │   └─ coder ↔ reviewer
+   │   └─ middleware finalize
+   └─ 渲染 → SSE 推 done
+```
+
+## 🧱 实际模块结构（v1.0 当前）
+
+```
+backend/app/
+├── main.py                              # FastAPI 入口；CORS + 静态 /media
+├── config.py                            # 读项目根 .env；model_name="MiniMax-M3"
+├── agents/
+│   ├── builder.py                       # build_agent 工厂（lru_cache 单例）
+│   ├── supervisor.py                    # ⭐ LangGraph StateGraph Supervisor
+│   │   ├── entry_router (phase=scripting/coding/done)
+│   │   ├── _script_decision_node (LLM 决策 need_script)
+│   │   ├── _script_designer_node (结构化 SceneScript)
+│   │   ├── _make_coder_node (单 agent + invoke_with_recovery)
+│   │   ├── _reviewer_node (CodeReview LLM)
+│   │   └── _route_after_reviewer (string only — dict 会让 LangGraph 炸)
+│   ├── script_designer.py               # SceneScript Pydantic + 提示词
+│   ├── reviewer.py                      # build_reviewer_llm + CodeReview schema
+│   ├── memory.py                        # build_memory_block — 偏好/历史/反馈
+│   ├── memory_curator.py                # ⭐ MemoryCurator — 异步分析 + 写 user_memories
+│   ├── algorithm_extractor.py           # extract_algorithm_name — 写 user_algorithm_history
+│   ├── agent_recovery.py                # 4 层兜底（thinking / aggressive / fence + 1-shot retry）
+│   ├── summarizer.py                    # few-shot 摘要生成
+│   ├── retriever.py                     # few-shot 召回（embedding + 关键词 fallback）
+│   ├── styles.py                        # 3 风格注册（academic / 3b1b / minimal）
+│   ├── tools.py                         # @tool validate_manim_code / render_manim_dryrun
+│   ├── schemas.py                       # CodeOutput / CodeReview / SceneScript
+│   ├── prompts.py                       # 提示词拼装
+│   ├── service.py                       # AgentService（路由层唯一编排入口）
+│   ├── dao/                             # ⭐ 数据访问层（按表拆文件）
+│   │   ├── conversations.py
+│   │   ├── messages.py
+│   │   ├── agent_steps.py
+│   │   └── ...
+│   └── middleware/
+│       └── persistence.py               # ⭐ AgentPersistenceMiddleware（统一持久化入口）
+├── api/v1/
+│   ├── conversations.py                 # ⭐ /conversations + /refine + /confirm
+│   ├── few_shots.py                     # /few_shots CRUD + embedding
+│   ├── preferences.py                   # /preferences 用户偏好
+│   ├── feedback.py                      # /feedback 收藏为范例
+│   ├── memories.py                      # /memories 长期记忆
+│   ├── health.py
+│   └── readyz.py
+├── renderers/manim.py                   # subprocess + 60s 超时
+├── tools/validator.py                   # AST + 危险模式 + Scene 子类检查
+├── llm/client.py                        # ChatLiteLLM 封装为 ChatOpenAI
+├── embeddings.py                        # BGE-small-zh + 异步 batch
+└── db/
+    ├── session.py                       # async_session_factory
+    └── models/
+        ├── user.py
+        ├── conversation.py              # 含 phase + current_script JSONB
+        ├── message.py
+        ├── agent_step.py                # 节点级 trace
+        ├── few_shot.py                  # 摘要 + embedding
+        ├── user_preference.py
+        ├── user_algorithm_history.py
+        ├── user_memory.py               # ⭐ 长期记忆
+        └── feedback.py
 
 shared/prompts/
-├── system/v1.txt                     # System prompt（含硬性约束）
-└── (空)                              # 早期 hardcoded few-shot 目录已废弃；改为 few_shots 表 + embedding 检索
+├── system/v1.txt                        # System prompt（硬性约束 + 风格指南）
+└── styles/                              # 3 风格补充
 
 frontend/
-├── app/page.tsx                      # EventSource 订阅 + 进度条 + 视频 + 代码框
-└── lib/api.ts                        # generateCode / renderManim / subscribeGenerate
-
-docker/docker-compose.yml             # postgres + redis（redis 未接业务）
+├── app/page.tsx                         # ⭐ 3 栏布局 + 脚本面板 + SSE 订阅
+└── lib/
+    ├── api.ts                           # fetchJson + 类型
+    └── user.ts                          # ULID + localStorage
 ```
 
 ## 📝 关键决策记录 (ADR)
 
-### ADR-001 · 默认 LLM 切换为 MiniMax-M3
-- **决策**：默认从 DeepSeek-V3 切到 **MiniMax-M3**
-- **理由**：公司内部模型、可控；OpenAI 兼容 API
-- **代价**（~~不支持 `tool_calls`，被迫手写 agent loop~~ → **2026-08 缓解**）
-- **现状**：通过 `langchain-litellm` 内嵌归一化，业务层用标准 LangChain 1.x 写法
+### ADR-001 · 默认 LLM = MiniMax-M3（LiteLLM 适配层）
+- 同 v1.0 早期，未变。
 
 ### ADR-002 · 同步渲染，不上 Worker（v1.0 简化）
-- **决策**：渲染在 API 进程内同步执行，**不**接 Redis / RQ Worker
-- **理由**：v1.0 范围是"3 个算法端到端跑通"；异步化是 v1.x 工作
-- **代价**：渲染期间 API 阻塞；60s 超时上限
-- **缓解**：前端用 SSE 流式推进度，UX 不完全卡死
+- 同 v1.0 早期。**v1.x TODO**：rq.enqueue 解 API 阻塞。
 
 ### ADR-003 · SSE 替代 WebSocket
-- **决策**：实时进度推送用 **SSE**（`EventSource`），不用 WebSocket
-- **理由**：单向（服务端 → 客户端）、HTTP 友好、调试简单
-- **未来**：需要双向交互时再换 WebSocket
+- 同 v1.0 早期。
 
 ### ADR-004 · ManimCE 而非 ManimGL
-- 同原版，未变
+- 同 v1.0 早期。
 
-### ADR-005 · 标准 LangChain 1.x `create_agent` + LiteLLM 适配层（2026-08 升级）
-- **决策**：用 `langchain.agents.create_agent(model=, tools=, system_prompt=, response_format=)` 标准 API；模型层 `langchain-litellm.ChatLiteLLM` 封装为 `ChatOpenAI` 类型
-- **理由**：MiniMax 协议归一化交给 LiteLLM；业务层 100% 标准 LangChain 写法；换厂商只改 `client.py`
-- **迁移路径**：未来换原生支持 tool_calls 的 LLM（GPT-4o 等），`client.py` 一行 import 切换即可
+### ADR-005 · 标准 LangChain 1.x `create_agent` + LiteLLM 适配层
+- 仍生效；Coder 内部继续用 `create_agent` + `invoke_with_recovery`。
 
-### ADR-006 · 匿名 ULID 用户（2026-08 上线）
-- **决策**：身份 = 客户端 26 位 Crockford ULID，存在 `localStorage`，请求带 `X-User-Id` header；服务端中间件校验，缺失/非法回落 `ANON_USER_ID`
-- **理由**：用户明确要求最简方案，不要登录 / 验证 / 邮箱
-- **代价**：浏览器清缓存 = 失忆；不同浏览器 / 设备看到的历史互相看不到
-- **未来**：如果要登录系统，把 `User` model 扩展为可选 `email` 字段、`users.id` 仍可为 ULID，新增 `auth_tokens` 表做 session 即可
+### ADR-006 · 匿名 ULID 用户
+- 同 v1.0 早期。
 
-### ADR-007 · 双 agent 路径合一（2026-08 重构）
-- **决策**：`run_agent`（单次）和 `run_refine`（多轮）都走 `builder.build_agent(style_id, extra_system_prompt=...)`；按 `(style_id, extra_prompt)` 维度 lru_cache
-- **理由**：以前 `refine` 自己调 `create_agent`，等于"两条工厂路径"，以后加 tool / 改 schema 要改两处
-- **代价**：`extra_system_prompt` 不同会破坏 cache 复用，但 refine 调用不频繁，可忽略
+### ADR-007 · 双 agent 路径合一
+- 仍生效；P3 起加 Script Designer / Reviewer 也走同一 `build_agent` 工厂。
+
+### ADR-008 · LangGraph `StateGraph` Supervisor（Coder ↔ Reviewer + 入口分诊 + Script Designer）（2026-08 P2/P3）
+- **决策**：v1.x 把单 agent 升级为 LangGraph `StateGraph`，节点 = Script Designer / Coder / Reviewer，条件边控制 routing；Coder 仍是 `create_agent` 单例（reuse factory），Supervisor 只在外层加编排
+- **理由**：
+  - P2 Reviewer 节点：能 catch Coder 自检漏掉的边界 case（API 错误、AST 黑名单外但语义错）
+  - P3 Script Designer：复杂 / 抽象 prompt 先出脚本给用户确认 → 一次成功率↑ + 用户不被黑盒
+  - 入口分诊：明确指令直接走 Coder，省一次 LLM
+- **条件边硬性规则**（防回归）：router 函数必须只返 `str`（`Literal["coder", "__end__"]`）— **返 dict 会让 LangGraph `TypeError: cannot use 'dict' as a dict key`**
+- **代价**：StateGraph 不可调试性比单 agent 差，依赖可视化（`g.draw_mermaid()` 出图）
+
+### ADR-009 · LangChain 官方 Middleware 统一 Agent 持久化（2026-08 重构）
+- **决策**：所有 agent 运行追踪（agent_steps / assistant message 自动 finalize）走 LangChain 1.x 官方 `AgentMiddleware`，不再在路由层手写埋点
+- **理由**：
+  - 路由层只做 HTTP 调度，业务零侵入
+  - 中间件一处实现，所有 agent 入口（`run_initial` / `run_after_confirm` / `run_refine`）自动生效
+  - 解耦：DB 操作在 `agents/dao/`，中间件只调 DAO，不直接写 SQL
+- **架构**：
+  ```
+  API 路由 (FastAPI)
+    └─ AgentService.run_*(...)
+         └─ supervisor.ainvoke(...)
+              └─ create_agent(..., middleware=[AgentPersistenceMiddleware])
+                   └─ AgentPersistenceMiddleware.before_agent / after_agent
+                        └─ AgentStepsDAO / MessagesDAO
+  ```
+- **单行依赖方向**：Web → Agent → DAO；DAO 不知道上层存在。
+
+### ADR-010 · 长期记忆 + Memory Curator（2026-08 P3）
+- **决策**：每条 conversation 跑完后异步调 `MemoryCurator` 分析这次 run 提取长期记忆，存 `user_memories` 表
+- **schema**：`user_memories(user_id, kind, content, importance, source_conversation_id, created_at)`，kind ∈ {preference, fact, algorithm, feedback}
+- **召回**：`build_memory_block` 拼到 system prompt 头部，按 user 召回 top-N
+- **异步**：在 `agent.run` 完成后 fire-and-forget，不阻塞响应
+- **理由**：跨会话持续学习用户偏好（风格、难度、关注点）→ 一次成功率↑
+
+### ADR-011 · few-shot 检索替代硬编码（2026-08）
+- **决策**：`shared/prompts/styles/*.md` 里硬编码 few-shot **全部废弃**；改为 `few_shots` 表 + embedding（BGE-small-zh, dim=512）+ retriever 按相似度召回 top-2
+- **理由**：用户能"👍 收藏为范例"自己积累库；retriever 自动按 prompt 匹配
+- **fallback**：embedding 缺失时按 recency 兜底
+- **后台**：`POST /api/v1/few_shots` 入库时同步调 `embed_one_async` 算 embedding
+
+## 🛡 分层硬性规范（2026-08 强化）
+
+> 之前几轮重构反复出问题，固化为规范：
+
+1. **Web 层**（`app/api/v1/`）只做 HTTP 接收 / 鉴权 / 调 AgentService / 渲染 / 响应 — **不允许写 agent 业务逻辑、DB 操作、prompt 拼装**
+2. **Agent 层**（`app/agents/`）只做业务编排 — **不允许写 FastAPI 路由、Pydantic Out schema**（schema 走 `app/schemas/` 或在 `app/api/v1/` 内部）
+3. **DAO 层**（`app/agents/dao/`）只做单表 CRUD — **不允许写跨表业务**
+4. **Middleware**（`app/agents/middleware/`）只做业务中转 — 调 DAO 方法，不直接写 SQL
+5. **依赖方向单向**：Web → Agent → DAO，DAO 不知道上层
 
 ## 🚨 安全考虑
 
 | 风险 | 缓解 | 状态 |
 |---|---|---|
 | 死循环 | subprocess timeout=60s | ✅ |
-| 删文件 / 网络请求 | AST 黑名单模式（`open` / `os.` / `requests` 等） | ✅ |
-| 内存炸弹 | ulimit（**待加**） | ❌ |
+| 删文件 / 网络请求 | AST 黑名单（`open` / `os.` / `requests` 等）| ✅ |
+| 内存炸弹 | ulimit | ❌ |
 | Docker 隔离 | v0.2 引入 | ❌ |
-
-## 📈 性能预算（实测参考）
-
-| 阶段 | 耗时预算 | 实测 |
-|---|---|---|
-| LLM 推理 | < 20s | — |
-| Manim 渲染 | < 30s | — |
-| **总** | **< 60s**（subprocess 超时上限） | — |
-
-> 实测数据需 Step 6（3 算法 × 10 次）跑完才有。
-
-## 🔮 TODO / 未来扩展
-
-| 项 | 说明 | 优先级 |
-|---|---|---|
-| **Worker 异步化** | `backend/app/workers/` 写渲染任务 + `rq.enqueue` 改 API | 高（解决 API 阻塞） |
-| **持久化** | ✅ Step 5 — users + conversations.user_id 完成（2026-08）；中英切换留 v1.1 | 高 |
-| **持久化记忆** | v1.1 — `user_preferences` + `user_algorithm_history`；按偏好 / 过去算法塞 prompt | 高 |
-| **few-shot 检索** | v1.1 — 把硬编码 few-shot 抽到 `few_shots` 表，按 prompt 关键词粗筛 1-2 个 | 高 |
-| **Docker 沙箱** | v0.2 计划 | 中 |
-| **LangGraph 状态机** | 备选方案；当前 `create_agent` 已足够，未来加多 Agent 编排时再评估 | 低 |
-| **LangSmith / LangFuse** | 可观测 | 中 |
-| **OSS / S3** | 视频存储 | 低 |
-| **多 LLM 切换** | DeepSeek-V3 / Qwen2.5-Coder 备胎 | 低 |
+| Prompt 注入 | system prompt 硬性约束 + few-shot 风格示范 | ✅ |
 
 ## 🔗 相关文档
 
 - 范围与里程碑 → [docs/mvp-scope.md](mvp-scope.md)
-- 工作流与 Agent 设计 → [docs/workflow-design.md](workflow-design.md)（与现状有出入，注意甄别）
+- 工作流与 Agent 设计 → [docs/workflow-design.md](workflow-design.md)
 - LLM Prompt → [docs/llm-prompt.md](llm-prompt.md)
 - 本次 session 改动 → [docs/session-summary.md](session-summary.md)
 - 启动命令 → [docs/quickstart.md](quickstart.md)

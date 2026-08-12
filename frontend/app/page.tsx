@@ -183,6 +183,17 @@ export default function Page() {
       const detail = await getConversation(c.id);
       setActiveConversation(detail);
       setError(null);
+      // P3：脚本待确认状态的会话被重新点开 — 恢复 ScriptReviewPanel。
+      // 后端 get_conversation 现在带 phase + current_script，前端据此重建。
+      if (detail.phase === "scripting" && detail.current_script) {
+        setPendingScript({
+          conversationId: detail.id,
+          script: detail.current_script,
+        });
+        setStatus("script_ready");
+        setStatusLabel("脚本待确认");
+        return;
+      }
       setStatus("done");
       setStatusLabel(`已加载 v${detail.version}`);
     } catch (e) {
@@ -259,6 +270,8 @@ export default function Page() {
       title: prompt.slice(0, 20),
       style,
       version: 0,
+      phase: "scripting",
+      current_script: null,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
       messages: [

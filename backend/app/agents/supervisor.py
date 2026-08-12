@@ -233,7 +233,6 @@ async def _reviewer_node(state: SupervisorState) -> dict:
     ]
     try:
         review: CodeReview = await llm.ainvoke(messages)
-        return {"review": review}
     except Exception as exc:
         # 解析失败 / LLM 输出格式不对 — fallback 通过，不阻塞主流程
         logger.warning(
@@ -241,10 +240,19 @@ async def _reviewer_node(state: SupervisorState) -> dict:
             state.get("conversation_id", ""), type(exc).__name__,
         )
         return {"review": CodeReview(ok=True, feedback="")}
+    update: dict = {"review": review}
+    # 不通过就把 feedback 提前写进 state — router 只返 string，
+    # state update 不能放 router 里（LangGraph 用 router 返回值当 ends key，
+    # dict 不可 hash → TypeError）。
+    if not review.ok:
+        update["previous_feedback"] = (
+            review.feedback or "审查未通过，请根据上面要求修正。"
+        )
+    return update
 
 
 def _route_after_reviewer(state: SupervisorState) -> Literal["coder", "__end__"]:
-    """Reviewer 之后的条件边。"""
+    """Reviewer 之后的条件边 — 只返 string，不能返 state update。"""
     review = state.get("review")
     if review is None:
         return "__end__"
@@ -252,8 +260,7 @@ def _route_after_reviewer(state: SupervisorState) -> Literal["coder", "__end__"]
         return "__end__"
     if int(state.get("code_round", 0)) >= MAX_CODE_ROUNDS:
         return "__end__"
-    # 把 review.feedback 写进 previous_feedback，Coder 下次看到
-    return {"previous_feedback": review.feedback or "审查未通过，请根据上面要求修正。", "code_round": state.get("code_round", 0)}
+    return "coder"
 
 
 # ---------------------------------------------------------------------------

@@ -195,6 +195,7 @@ export interface ConversationRecord {
   title: string;
   style: StyleId | string;
   version: number;
+  phase: string;
   created_at: string;
   updated_at: string;
 }
@@ -214,6 +215,7 @@ export interface MessageRecord {
 
 export interface ConversationDetail extends ConversationRecord {
   messages: MessageRecord[];
+  current_script?: ScriptDraft | null;
 }
 
 export interface SceneDraft {
@@ -278,6 +280,8 @@ export async function deleteConversation(id: string): Promise<{ deleted: string 
 export interface ConfirmConversationResult {
   code: string;
   scene_name: string | null;
+  video_url: string | null;
+  duration_sec: number | null;
   conversation_id: string;
 }
 

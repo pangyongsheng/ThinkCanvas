@@ -66,12 +66,14 @@ class ConversationOut(BaseModel):
     title: str
     style: str
     version: int
+    phase: str = "coding"
     created_at: str
     updated_at: str
 
 
 class ConversationDetailOut(ConversationOut):
     messages: list[MessageOut]
+    current_script: dict | None = None
 
 
 def _conv_to_out(c) -> ConversationOut:
@@ -80,6 +82,7 @@ def _conv_to_out(c) -> ConversationOut:
         title=c.title,
         style=c.style,
         version=c.version or 0,
+        phase=getattr(c, "phase", None) or "coding",
         created_at=c.created_at.isoformat() if c.created_at else "",
         updated_at=c.updated_at.isoformat() if c.updated_at else "",
     )
@@ -278,9 +281,35 @@ async def confirm_conversation(
     if not run_result.code:
         raise HTTPException(status_code=409, detail="agent failed to produce code after confirm")
 
+    scene_name = run_result.scene_name or extract_scene_name(run_result.code)
+
+    # P3 修复：之前只返 code + scene_name，前端 getConversation 拿到
+    # video_url=null → "视频还没渲染好" 卡死半小时。现在跟 create_conversation
+    # 一样：跑 agent → 渲染 → attach_video → 一起返。
+    render_result = await render_code(run_result.code, scene_name)
+    if render_result.error or not render_result.video_path:
+        err = render_result.error or "no video"
+        async with async_session_factory() as s:
+            await AgentService(s).mark_render_failed(
+                message_id=run_result.assistant_message.id,
+                error=err,
+            )
+        raise HTTPException(status_code=500, detail=f"render error: {err}")
+
+    from app.api.v1.render import to_video_url
+    video_url = to_video_url(render_result.video_path)
+    async with async_session_factory() as s:
+        await AgentService(s).attach_video(
+            message_id=run_result.assistant_message.id,
+            video_url=video_url,
+            duration_sec=render_result.duration_sec,
+        )
+
     return JSONResponse({
         "code": run_result.code,
-        "scene_name": run_result.scene_name,
+        "scene_name": scene_name,
+        "video_url": video_url,
+        "duration_sec": render_result.duration_sec,
         "conversation_id": conversation_id,
     })
 

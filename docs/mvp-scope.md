@@ -66,20 +66,69 @@
 ### v1.1.6 · 端到端压测（TODO）
 - 3 算法 × 10 次，记录成功率 / 时长 / 修整
 
+## 🆕 v1.x P2/P3 阶段（2026-08 上线 — 已完成）
+
+> v1.0 基线后，**已经实际完成**的 v1.x 工作。这一节反映代码现状，不是计划。
+
+### v1.x.1 · LangGraph `StateGraph` Supervisor（Coder ↔ Reviewer）
+- 节点：`_script_decision_node` / `_script_designer_node` / `_make_coder_node` / `_reviewer_node`
+- 入口条件边：phase=scripting 走 script_decision，phase=coding 直接 coder
+- Reviewer 失败 → 写 `previous_feedback` 续跑，最多 `MAX_CODE_ROUNDS` 轮
+- `app/agents/supervisor.py` 总入口 `build_supervisor(...)`
+- **硬性规则**：条件边 router 必须只返 `str`，**不能返 dict**（`TypeError: cannot use 'dict' as a dict key` 回归保护）
+
+### v1.x.2 · LangChain 官方 `AgentMiddleware` 统一持久化
+- `app/agents/middleware/persistence.py` — `AgentPersistenceMiddleware`
+- `before_agent` 建 assistant 消息壳，`after_agent` finalize
+- 所有 agent 入口（`run_initial` / `run_after_confirm` / `run_refine`）一处中间件全生效
+- 路由层不再手写埋点
+
+### v1.x.3 · 长期记忆 + Memory Curator
+- 3 张表：`user_preferences` / `user_algorithm_history` / `user_memories`
+- `app/agents/memory.py::build_memory_block` 召回拼到 system prompt 头部
+- `app/agents/memory_curator.py::MemoryCurator` 异步分析每次 run，提取语义记忆写库
+- `app/agents/algorithm_extractor.py` 自动识别算法名写历史表
+
+### v1.x.4 · Script Designer + 脚本确认流程
+- 复杂 / 抽象 prompt 入口分诊 → Script Designer 出 SceneScript JSON → 前端弹脚本面板
+- 用户点「确认并生成」→ `POST /conversations/{id}/confirm` 走 phase=coding 续跑 Coder
+- 「改一下」直接走 refine 改 prompt，无需重跑 Script Designer
+- `handlePick` 加载历史待确认会话时自动恢复 ScriptReviewPanel
+
+### v1.x.5 · DAO 层拆分（解耦）
+- `app/agents/dao/` 按表拆文件：conversations / messages / agent_steps / ...
+- 路由层 → AgentService → DAO 单向依赖
+- DAO 不知道上层存在，禁止跨层侵入
+
+### v1.x.6 · 已知 BUG 修复（最近 3 轮）
+- **第 22 节** `handlePick` 漏恢复 pendingScript — 历史脚本待确认会话看着像卡死
+- **第 23 节** `_route_after_reviewer` 返 dict — LangGraph `TypeError`，confirm 500
+- **第 24 节** `confirm_conversation` 漏渲染 + attach_video — 半小时没视频
+
+### v1.x.7 · 端到端测试覆盖
+- `pytest -q` → **186 passed**（v1.0 早期 107 → v1.0 当前 186）
+- 静态扫描回归保护（防止 router 返 dict、confirm 漏渲染、phase 没透传）
+
 ---
 
-## 🤖 Agent / LangChain 学到的（截至 2026-08 重构）
+## 🤖 Agent / LangGraph 学到的（截至 2026-08 P3 升级）
 
 | 模式 | 实现位置 | 状态 |
 |---|---|---|
+| **LangGraph `StateGraph` Supervisor** | `app/agents/supervisor.py::build_supervisor` | ✅ 入口分诊 + Script Designer + Coder ↔ Reviewer |
+| **条件边 + 节点** | `app/agents/supervisor.py` | ✅ router 只返 `str`（不能返 dict — 静态扫描回归保护） |
+| **LangChain 1.x `create_agent`** | `app/agents/builder.py` | ✅ lru_cache 单例 |
+| **LangChain 官方 `AgentMiddleware`** | `app/agents/middleware/persistence.py` | ✅ before/after_agent 自动落 agent_steps + finalize assistant msg |
 | **LiteLLM 适配层** | `app/llm/client.py::ChatLiteLLM` 封装为 `ChatOpenAI` | ✅ 业务只见 `ChatOpenAI` |
-| **结构化输出**（`CodeOutput` Pydantic schema） | `app/agents/state.py::CodeOutput` + `create_agent(response_format=...)` | ✅ 6 test 通过 |
-| **标准 LangChain 1.x `create_agent`** | `app/agents/builder.py` 调用 `langchain.agents.create_agent` | ✅ 单例，lru_cache(style_id, extra_prompt) |
-| **四层兜底**（thinking / 字符串扫描 / 代码栅栏 + 1-shot retry） | `app/agents/agent_recovery.py::invoke_with_recovery` | ✅ MiniMax-M3 频繁只输出 thinking |
-| **多轮对话 prompt 拼装** | `app/agents/refine.py::_build_refine_prompt` | ✅ 历史用户指令 cap 6 条 |
+| **结构化输出**（`CodeOutput` / `CodeReview` / `SceneScript`） | `app/agents/schemas.py` | ✅ Pydantic schema + `with_structured_output` |
+| **4 层兜底**（thinking / 字符串扫描 / 代码栅栏 + 1-shot retry） | `app/agents/agent_recovery.py::invoke_with_recovery` | ✅ MiniMax-M3 频繁只输出 thinking |
+| **多轮对话 prompt 拼装** | `app/agents/service.py::_build_refine_prompt` | ✅ 历史用户指令 cap 6 条 |
+| **长期记忆 + 召回** | `app/agents/memory.py::build_memory_block` + `app/agents/memory_curator.py` | ✅ user_preferences / user_algorithm_history / user_memories |
+| **算法自动识别** | `app/agents/algorithm_extractor.py::extract_algorithm_name` | ✅ 写 user_algorithm_history |
+| **few-shot embedding 召回** | `app/agents/retriever.py::retrieve_similar_summaries` | ✅ BGE-small-zh + recency fallback |
 | **`@tool` 装饰器** | `app/agents/tools.py`（`validate_manim_code` / `render_manim_dryrun`） | ✅ agent 直接调用 |
-| **HTTP → Agent 分层** | `app/api/v1/generate.py` 只调 `run_agent()`；agent 在 `app/agents/builder.py` | ✅ |
-| **可观测性** | `app/core/logging.py` + `run_agent` 进出日志 + FastAPI 全局异常中间件 | ✅ |
+| **DAO 层拆分** | `app/agents/dao/` | ✅ 单向依赖 Web → Agent → DAO |
+| **可观测性** | `app/core/logging.py` + 节点级 trace（agent_steps 表）| ✅ |
 
 ### ⚠️ 已知问题（下一个模型应注意）
 
