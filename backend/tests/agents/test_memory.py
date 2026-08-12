@@ -90,3 +90,25 @@ def patch_dao(session, dao):
         yield
     finally:
         UserMemoriesDAO.list_active = orig_list_active
+
+
+@pytest.mark.asyncio
+async def test_dao_exception_triggers_session_rollback():
+    """build_memory_block 吞异常时必须 rollback session。
+
+    否则 SELECT 失败的 session 会停在 InFailedSQLTransactionError 状态，
+    调用方（service._run_agent）下一次 commit 直接炸。
+    """
+    dao = MagicMock()
+    dao.list_active = AsyncMock(side_effect=RuntimeError("boom"))
+
+    session = MagicMock()
+    session.rollback = AsyncMock()
+
+    with patch_dao(session, dao):
+        out = await memory.build_memory_block(session, user_id="u1")
+
+    # 必须 rollback 至少一次（即使 list_active 自己抛异常，session 也要救回来）
+    session.rollback.assert_awaited()
+    # 异常被吞掉，返回空字符串（不能因为记忆读不到就让整个请求挂掉）
+    assert out == ""

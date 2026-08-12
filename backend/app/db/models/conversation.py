@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, func
+from sqlalchemy import JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from ulid import ULID
 
@@ -56,9 +58,22 @@ class Conversation(Base):
         server_default=ANON_USER_ID,
     )
 
+    # P3 阶段控制 — "scripting" / "coding" / "done"
+    #   scripting — Script Designer 在跑，等用户确认脚本
+    #   coding   — 用户已确认（或简单任务跳过），Coder 跑
+    #   done     — 最终代码已生成
+    phase: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="coding", server_default="coding",
+    )
+    # P3 当前脚本（每轮 Script Designer 更新），None 表示还没出
+    current_script: Mapped[Optional[dict]] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), nullable=True,
+    )
+
     __table_args__ = (
         Index("ix_conversations_updated_at", "updated_at"),
         Index("ix_conversations_user_id", "user_id"),
+        Index("ix_conversations_phase", "phase"),
     )
 
     __all__ = ["Conversation"]

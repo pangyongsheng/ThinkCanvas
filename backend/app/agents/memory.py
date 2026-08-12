@@ -46,6 +46,14 @@ async def build_memory_block(
             user_id, limit=MAX_MEMORIES_IN_PROMPT,
         )
     except Exception:
+        # SELECT 失败会让 session 进入 failed transaction 状态，
+        # 调用方（_run_agent）后续还要用同一个 session 写 messages，
+        # 必须 rollback 把 session 救回来，否则下一次 commit 会炸
+        # asyncpg.exceptions.InFailedSQLTransactionError。
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.exception("memory.rollback_failed user=%s", user_id)
         logger.exception("memory.read_failed user=%s", user_id)
         return ""
 

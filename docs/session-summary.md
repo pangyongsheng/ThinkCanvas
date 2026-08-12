@@ -377,3 +377,322 @@ user_memories (
 2. 跑几次生成（每次都会触发 generation event → curator 加 memory）
 3. `curl http://localhost:8000/api/v1/memories -H "X-User-Id: <你的id>"` 看 curator 提炼了什么
 4. 给条 👎 + 注释，看下次会话 prompt 里出现对应 avoidance 类 memory
+
+### 17. LangGraph Supervisor 编排框架 P1（2026-08-10）
+
+把当前单 `create_agent` 跑全活的模式换成 LangGraph Supervisor 模式。
+P1 范围只挂 1 个 worker（`coder`），Supervisor LLM 只做"调 coder / 收工"
+的最小决策。P2 起会往 `agents=[...]` 列表里塞 Reviewer / Script Designer /
+Fixer，结构不动。
+
+#### 改了什么
+
+**新增**：
+- `backend/app/agents/supervisor.py` — `build_supervisor()` + `build_coder_worker()` 工厂
+- `backend/tests/agents/test_supervisor.py` — 11 个测试（worker 构造 / supervisor 构造 / 中间件兼容 state-context 双路径）
+
+**修改**：
+- `backend/app/agents/middleware/persistence.py` — `abefore_agent` 走 `_resolve_conversation_id` / `_resolve_on_event` 兼容 state / context 双路径（Supervisor 不会透传 `runtime.context`，必须能走 state 兜底）
+- `backend/app/agents/service.py::_run_agent` — `build_agent` → `build_supervisor`；`supervisor_input` 把 `conversation_id` / `on_event` 塞进 state
+
+#### 架构
+
+```
+Supervisor（LLM 决策：调 coder / 收工）
+  └─ coder（ReAct worker，validate + render tools + AgentPersistenceMiddleware）
+```
+
+Supervisor 节点：
+- `__start__` → `supervisor` → `coder` → `supervisor` → 结束
+- 节点名来自 `langgraph_supervisor.create_supervisor`
+
+#### 关键决策
+
+1. **Coder worker 仍带 `response_format=CodeOutput`** — Supervisor 的 `output_mode="full_history"` 让 messages 链能走 `extract_from_result` 兜底
+2. **middleware 只挂 Coder 不挂 Supervisor** — 落库 / SSE 是 worker 行为，supervisor 自身不需要
+3. **不缓存 CompiledStateGraph** — Supervisor 的 worker 列表 / prompt 每次都变（few-shot / extra），缓存命中率低
+4. **context 兼容双路径** — 老路径 `ainvoke(context={...})` 仍能跑；Supervisor 路径走 `state["conversation_id"]` 兜底
+
+#### 验证
+
+- `pytest -q`：**157 passed**（146 + 11 新增）
+- `build_supervisor().nodes`：`['__start__', 'supervisor', 'coder']` ✓
+- 现有 conversations / refine 集成测试不动也都过（`AgentService._run_agent` 路径已切换）
+
+#### P2-P4 计划
+
+| 阶段 | 加什么 |
+|---|---|
+| P2 | Reviewer worker（Coder → Reviewer 循环，`code_round` 控上限 2 轮） |
+| P3 | Script Designer + ask_human worker（入口分流 + 用户确认脚本） |
+| P4 | Fixer worker（render 失败回灌修代码） |
+
+每阶段 P 都在 supervisor.py 的 `agents=[...]` 列表里加新 worker；Supervisor
+的 prompt 增对应决策规则；P2 起需要扩 SupervisorState 字段（如
+`code_round` / `fix_round` / `script` / `script_confirmed`）。
+
+#### 修 P1 引入的两个 BUG（2026-08-10 晚）
+
+**BUG 1 · `InFailedSQLTransactionError`**
+
+`build_memory_block` 吞异常时没 rollback session。SELECT 失败的
+session 停在 failed transaction 状态，下一次 `commit()` 直接报
+`asyncpg.exceptions.InFailedSQLTransactionError`。
+
+修：
+- `app/agents/memory.py::build_memory_block` 的 except 块加
+  `await session.rollback()` 把 session 救回来
+- `app/agents/service.py::_run_agent` 整个 `supervisor.ainvoke` 用
+  try/except 包，失败时 rollback + mark_failed 写回 assistant 消息
+- `tests/agents/test_memory.py` 加 `test_dao_exception_triggers_session_rollback`
+
+**BUG 2 · `greenlet_spawn has not been called`**
+
+`langgraph_supervisor.create_supervisor` 包裹 worker 时不传
+`runtime.context`（subgraph 调用），worker 子图的 greenlet 边界在
+asyncpg / MiniMax-M3 组合下报 "greenlet_spawn has not been called" —
+中间件的 context 路径失效，state 兜底又被 supervisor 的 state schema
+拒掉（AgentState 不允许业务字段）。
+
+修（**P1 简化方案**）：
+- `app/agents/supervisor.py::build_supervisor` 改走 Coder 直接路径，
+  P1 阶段不包 `create_supervisor`
+- 1 个 worker 时 supervisor LLM 决策层没价值（永远"调 coder"）
+- 少一次 LLM 调用、少一层 subgraph 边界
+- P2+ 加 Reviewer / Script Designer / Fixer 时切回 `create_supervisor`，
+  那时再扩 SupervisorState 显式包含 `conversation_id` / `code_round`
+  等业务字段，并保持 context 透传修复
+
+**测试**：158 passed（157 + 1 memory rollback 用例）
+
+**重启后行为**：refine 走 Coder 直接路径，context 正常透传，跟重构前
+完全等价。出图流程不变。
+
+### 18. P2 · Reviewer worker 上线（2026-08-10）
+
+Coder 写完代码后加一层独立审查。审查不通过就让 Coder 重写，
+最多 2 轮（Coder 最多跑 2 次：首轮 + 1 次 retry）。
+
+**架构（graph-driven，不用真 Supervisor）**：
+
+```
+[__start__] → Coder → Reviewer ── ok 或 round≥2 ─→ [__end__]
+                              └─ 不ok && round<2 ─→ Coder (附 feedback)
+```
+
+P2 流程固定（Coder ↔ Reviewer 循环），用 `StateGraph` + 条件边比
+`create_supervisor` (LLM 决策) 更可预测，避开之前 P1 的
+`create_supervisor` 包裹 worker 的 greenlet 边界问题。
+P3+ 加 Script Designer 入口分流时再上真 Supervisor。
+
+**新增**：
+- `backend/app/agents/reviewer.py` — `CodeReview` Pydantic schema +
+  Reviewer system prompt + user message 拼装 helper
+- `backend/app/agents/supervisor.py` — 改 P2：StateGraph 含 coder /
+  reviewer 两个 node + 条件边 + `SupervisorState` TypedDict +
+  `MAX_CODE_ROUNDS = 2`
+
+**修改**：
+- `backend/app/agents/service.py::_run_agent` — 不再走 `invoke_with_recovery`
+  包裹（Coder 节点内部已自带），直接 `supervisor.ainvoke` 后从 P2 state 抽
+  `code` / `thought` / `scene_name` / `review` / `code_round`
+- `backend/tests/agents/test_supervisor.py` — 改 P2：18 个测试覆盖
+  worker 构造 / supervisor 图结构 / Reviewer helpers / middleware 兼容
+
+**State schema（`SupervisorState`）**：
+- `messages` — 标准（add_messages 归约）
+- `conversation_id` / `on_event` — 给中间件 / SSE
+- `code` / `thought` / `scene_name` — Coder 输出
+- `review` — Reviewer `CodeReview` 对象
+- `code_round` — 0, 1, 2（cap 在 `MAX_CODE_ROUNDS`）
+- `previous_feedback` — 上一轮 review.feedback，Coder 第二轮拼到 extra prompt
+
+**Reviewer 审查维度**（不替用户审"好不好看"）：
+- Manim API 用对没（import / Scene / construct / play / wait）
+- 危险调用（os / subprocess / while True / open / 网络）
+- 代码完整不截断
+- AST 没语法错
+
+**验证**：
+- `pytest -q`：**165 passed**（158 + 7 新增）
+- `build_supervisor().nodes`：`['__start__', 'coder', 'reviewer']` ✓
+- mermaid 图含 `coder` / `reviewer` / 条件边 ✓
+
+### 19. P3 · Script Designer 入口分流（2026-08-10）
+
+复杂需求先出脚本给人确认，简单直接走 Coder。Supervisor
+图加 Script Designer 节点 + 入口分诊节点 + 路由按 phase 派发。
+
+**架构（StateGraph）**：
+
+```
+[__start__] (phase=scripting) → script_decision
+                                       ↓ need_script?
+                              ┌────────┴────────┐
+                              ↓                  ↓
+                       script_designer        coder (跳到 P2 流程)
+                              ↓
+                         [__end__]   (停在这等用户确认)
+
+[__start__] (phase=coding) → coder → reviewer (P2 流程)
+```
+
+**新增**：
+- `backend/alembic/versions/20260810_add_script_phase.py` — 加
+  conversations.phase / current_script JSONB / messages.phase + 索引
+- `backend/app/agents/script_designer.py` — `Scene` / `SceneScript`
+  Pydantic schema + Script Designer prompt + user message helper
+- `backend/tests/agents/test_script_designer.py` — 8 个 schema / helper 测试
+- `backend/app/api/v1/conversations.py` — 新增
+  `POST /conversations/{id}/confirm` 续跑 endpoint（同步返回 code）
+
+**修改**：
+- `backend/app/db/models/conversation.py` — Conversation 加 phase
+  / current_script 字段（current_script 用 `JSONB().with_variant(JSON, "sqlite")`
+  兼容 SQLite 测试）
+- `backend/app/db/models/message.py` — Message 加 phase 字段
+- `backend/app/agents/supervisor.py` — 扩 SupervisorState 加
+  phase / current_script / script_confirmed / need_script；
+  加 script_decision / script_designer 两个 node + 三个
+  condition router；入口按 phase 决定从哪起跑；
+  解析失败 fallback（decision → need_script=True；designer → phase=coding）
+- `backend/app/agents/service.py` — `AgentRunResult` 加
+  phase / script / need_script 字段；`run_initial` 默认 phase=scripting；
+  新增 `run_after_confirm` 续跑入口；`_run_agent` 返回 (msg, state) 元组
+- `backend/app/agents/dao/conversations.py` — 加 `set_phase` /
+  `update_after_run` DAO 方法
+
+**SSE 事件**（P3 新增）：
+- `script_ready` — 脚本生成完推给前端，含 `script` dict + `need_script` 布尔
+- 前端看到后弹脚本确认面板，用户点"OK" / "改一下"
+- 用户点确认 → POST `/conversations/{id}/confirm` → 续跑 phase=coding
+
+**降级策略**：
+- Script Designer 解析失败 → `phase=coding`（跳过脚本直接进 Coder）
+- Script Decision 解析失败 → `need_script=True`（按复杂走，宁可多走一步）
+- 与 Reviewer 解析失败 fallback `ok=True` 对称
+
+**验证**：
+- `pytest -q`：**173 passed**（165 + 8 新增）
+- P3 supervisor 节点：`['__start__', 'script_decision', 'script_designer', 'coder', 'reviewer']` ✓
+- `build_supervisor(phase="scripting")` / `build_supervisor(phase="coding")` 都跑通
+
+**重启后行为**：
+- 第一次跑（前端不传 phase）：默认 phase=scripting，先过 Script Designer
+- 复杂需求 → 出脚本 → SSE 推 `script_ready` → 前端弹面板
+- 简单需求 → Script Designer 判定不需脚本 → 直接进 Coder → 视频
+- 用户点确认 → POST `/conversations/{id}/confirm` → phase=coding → 出视频
+
+## 19. P3 BUG 修复 — `run_initial` scripting 阶段不要求 assistant_message
+
+**症状**：用户发"解释傅里叶变换"（概念性内容，走 Script Designer
+路径），后端报 `RuntimeError: AgentService: no assistant message
+after run_initial (conversation=...)`。
+
+**根因**：P3 默认 `phase=scripting`，图走
+`script_decision` → `script_designer` → `__end__`（停在那等用户确认）。
+**Coder 从未执行**，因此 `AgentPersistenceMiddleware.abefore_agent`
+不触发，assistant 消息壳没建。
+
+`service.run_initial` 里 `_require_message(...)` 硬性要求
+`assistant_msg is not None`，脚本阶段本来就不该有 — 抛 RuntimeError。
+
+**修复**：
+- `backend/app/agents/service.py::AgentRunResult.assistant_message`
+  类型改 `Optional[Message]`
+- `backend/app/agents/service.py::run_initial` — `final_phase ==
+  PHASE_SCRIPTING` 时不再 `_require_message`，`assistant_message`
+  可为 `None`；`code` / `scene_name` 也加 None-safe 取值
+- `backend/app/agents/service.py::_require_message` docstring 更新
+  说明"只对 coding 阶段断言"
+
+**测试**：
+- `backend/tests/agents/test_service_run_initial.py`（新增 3 用例）
+  * `test_run_initial_scripting_phase_allows_none_assistant` —
+    脚本阶段 `assistant_msg=None` 不抛错，正常返回 `script`
+  * `test_run_initial_coding_phase_requires_assistant` — coding
+    阶段缺 assistant_msg 仍按原逻辑抛 RuntimeError（防御回归）
+  * `test_run_initial_coding_phase_with_assistant_succeeds` —
+    coding 阶段正常路径
+
+**验证**：`pytest -q` → **176 passed**（173 + 3）
+
+**前端/路由层影响**：零。`POST /conversations` 路由 runner 看到
+`phase == "scripting" and script` 走 `script_ready` SSE 分支并 return，
+从不访问 `assistant_message.id`；coding 阶段 `_require_message`
+已保证 `assistant_message` 不为 None。
+
+## 20. P3 BUG 修复 — 脚本阶段前端 Promise 永远 pending
+
+**症状**：用户发概念性需求（"傅里叶积分变化" 等），脚本生成后
+页面卡死 30 分钟不响应。后端处理几秒就完成，但前端 spinner
+一直转。
+
+**根因**：`subscribeCreateConversation` 里 Promise 只在收到
+`done` 或 `failed` 事件时 resolve/reject。后端 `script_ready`
+事件发了之后**没发 done**就 return，前端 Promise 永远 pending，
+`busy` 状态卡住。`CreateStreamHandlers` 里也没 `scriptReady` handler，
+事件本身也被忽略。
+
+**修复**：
+- `backend/app/api/v1/conversations.py` — `script_ready` 后
+  补发 `done(status="script_ready", ...)`，payload 含脚本；
+  Promise 能正常 resolve
+- `frontend/lib/api.ts` —
+  * `CreateConversationResult` 加 `status` / `script` / `need_script` 字段
+  * 新增 `ScriptDraft` / `SceneDraft` 类型
+  * 新增 `confirmConversation(conversationId)` 函数封装
+    `POST /conversations/{id}/confirm`
+- `frontend/app/page.tsx` —
+  * `Status` 类型加 `"script_ready"`
+  * 新增 `pendingScript` state
+  * `done` handler 识别 `status === "script_ready"` → 设
+    `pendingScript`、显示脚本面板、不调用 `getConversation`
+  * `handleConfirmScript` — 调 `confirmConversation`，刷
+    activeConversation，状态切 `done`
+  * `handleRejectScript` — 清 pendingScript，让用户重写 prompt
+  * `ScriptReviewPanel` 组件 — 标题/概念/总时长/风格 +
+    每个分镜的视觉/动画/文字标注 + 右上角"改一下"/"确认并生成"按钮
+  * `reset()` 一并清 pendingScript
+
+**验证**：
+- 前端 `tsc --noEmit` 通过
+- 后端 `pytest -q` → **176 passed**（无回归）
+
+**用户流程**（脚本阶段）：
+1. 发概念性需求 → 后端判定需脚本 → 生成脚本
+2. 主区域弹 `ScriptReviewPanel`（不再是无限 spinner）
+3. 用户可点：
+   * **确认并生成** → POST `/conversations/{id}/confirm` →
+     Coder 续跑 → 出视频
+   * **改一下** → 清面板 + 状态，用户在右侧输入框重写需求
+
+## 21. P3 BUG 修复 — confirm 路径 500（`build_supervisor` 没收到 phase）
+
+**症状**：用户脚本确认后点"确认并生成"，`POST /conversations/{id}/confirm`
+返回 500。后端日志：`agent error: AgentService: no assistant message
+after run_after_confirm`。
+
+**根因**：`AgentService._run_agent` 收到 `phase=PHASE_CODING`（从
+`run_after_confirm` 传），但**没透传给 `build_supervisor`**。Supervisor
+默认 `phase=PHASE_SCRIPTING`，入口条件边：
+```python
+lambda state: "coder" if phase == PHASE_CODING else "script_decision"
+```
+闭包里的 `phase` 永远是 `"scripting"`，confirm 路径仍先跑 `script_decision`
+→ `script_designer`（LLM 出脚本或 fallback）→ `__end__`，Coder
+没机会跑 → middleware 没建 assistant 壳 → `_require_message` 抛
+RuntimeError → 500。
+
+**修复**：`backend/app/agents/service.py::_run_agent` —
+`build_supervisor(...)` 加 `phase=phase` 参数透传。
+
+**测试**：
+- `test_run_after_confirm_passes_coding_phase_to_run_agent` —
+  spy `_run_agent` 验证收到 `phase=PHASE_CODING`
+- `test_run_agent_signature_passes_phase_to_build_supervisor` —
+  静态扫描 `_run_agent` 源码断言 `build_supervisor(...)` 调用里
+  有 `phase=phase`（防漏传回归成本最低）
+- `test_run_initial_default_phase_scripting` — 默认 phase 验证
+
+**验证**：`pytest -q` → **179 passed**（176 + 3）

@@ -50,6 +50,12 @@ class Message(Base):
     # 这次生成 LLM 实际调了几次工具（汇总指标）。agent_steps 表存每步明细。
     tool_calls: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)
 
+    # P3 阶段标记 — 区分消息属于哪个 phase（scripting 阶段生成的
+    # 脚本消息 vs coding 阶段生成的代码消息）
+    phase: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="coding", server_default="coding",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

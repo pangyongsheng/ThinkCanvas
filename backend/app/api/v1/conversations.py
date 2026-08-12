@@ -149,6 +149,28 @@ async def create_conversation(
                 await on_event("failed", {"error": f"agent error: {exc}"})
                 return
 
+        # P3：scripting 阶段没出代码，把脚本推给用户
+        if run_result.phase == "scripting" and run_result.script:
+            await on_event("script_ready", {
+                "script": run_result.script,
+                "need_script": run_result.need_script,
+                "conversation_id": run_result.conversation.id,
+            })
+            # 再发 done（前端 Promise 等 done 才 resolve，缺这个会卡死）
+            await on_event("done", {
+                "status": "script_ready",
+                "conversation": _conv_to_out(run_result.conversation).model_dump(),
+                "message": _msg_to_out(run_result.user_message).model_dump(),
+                "assistant_message": None,
+                "code": None,
+                "video_url": None,
+                "duration_sec": None,
+                "scene_name": None,
+                "script": run_result.script,
+                "need_script": run_result.need_script,
+            })
+            return
+
         if not run_result.code:
             err = "agent failed to produce code"
             async with async_session_factory() as s:
@@ -213,6 +235,54 @@ async def create_conversation(
 # ---------------------------------------------------------------------------
 # /conversations/{id}/refine — 多轮调整
 # ---------------------------------------------------------------------------
+
+
+@router.post("/conversations/{conversation_id}/confirm")
+async def confirm_conversation(
+    conversation_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """用户确认脚本后调 — 续跑 phase=coding 的 supervisor（Coder → Reviewer）。
+
+    返回 AgentRunResult 的 JSON（不走 SSE，简单同步）。
+    """
+    from app.agents.service import AgentService
+    from app.agents.retriever import retrieve_similar_summaries
+    from fastapi.responses import JSONResponse
+    from app.agents.supervisor import PHASE_CODING
+
+    user_id = await _resolve_user_id(request, session)
+
+    # 召回 few-shot（基于 conv.title）
+    async with async_session_factory() as s:
+        conv = await s.get(__import__("app.db.models", fromlist=["Conversation"]).Conversation, conversation_id)
+        if conv is None or conv.user_id != user_id:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        few_shots = await retrieve_similar_summaries(
+            s, prompt=conv.title or "", style=conv.style, top_k=2,
+        )
+
+    async with async_session_factory() as s:
+        service = AgentService(s)
+        try:
+            run_result = await service.run_after_confirm(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                few_shots=few_shots,
+            )
+        except Exception as exc:
+            logger.exception("confirm_conversation.run_after_confirm failed")
+            raise HTTPException(status_code=500, detail=f"agent error: {exc}")
+
+    if not run_result.code:
+        raise HTTPException(status_code=409, detail="agent failed to produce code after confirm")
+
+    return JSONResponse({
+        "code": run_result.code,
+        "scene_name": run_result.scene_name,
+        "conversation_id": conversation_id,
+    })
 
 
 @router.post("/conversations/{conversation_id}/refine")

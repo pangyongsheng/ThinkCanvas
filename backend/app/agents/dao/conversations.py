@@ -89,6 +89,37 @@ class ConversationsDAO:
         await self.session.refresh(conv)
         return conv
 
+    async def set_phase(
+        self,
+        conversation_id: str,
+        phase: str,
+    ) -> None:
+        """单独更新 conversation.phase（不改其他字段）。"""
+        conv = await self.session.get(Conversation, conversation_id)
+        if conv is None:
+            return None
+        conv.phase = phase
+        await self.session.commit()
+        await self.session.refresh(conv)
+
+    async def update_after_run(
+        self,
+        *,
+        conversation_id: str,
+        phase: str | None = None,
+        current_script: dict | None = None,
+    ) -> None:
+        """跑完一次 supervisor 后更新 phase + current_script。"""
+        conv = await self.session.get(Conversation, conversation_id)
+        if conv is None:
+            return None
+        if phase is not None:
+            conv.phase = phase
+        if current_script is not None:
+            conv.current_script = current_script
+        await self.session.commit()
+        await self.session.refresh(conv)
+
     async def get(
         self,
         conversation_id: str,

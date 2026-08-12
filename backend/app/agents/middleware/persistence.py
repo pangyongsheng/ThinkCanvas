@@ -50,6 +50,28 @@ def _extract_scene_name(code: str | None) -> str | None:
     m = _SCENE_NAME_RE.search(code)
     return m.group(1) if m else None
 
+def _resolve_conversation_id(state: AgentState, runtime: Runtime) -> str | None:
+    """兼容地从 state / runtime.context 读 conversation_id。
+
+    优先 ``runtime.context``（直接 ``agent.ainvoke(context=...)`` 调用，
+    老 ``AgentService._run_agent`` 路径），回退 ``state``（Supervisor
+    把 worker 当 subgraph 调用时 context 不会透传）。
+    """
+    ctx = getattr(runtime, "context", None) or {}
+    if isinstance(ctx, dict):
+        cid = ctx.get("conversation_id")
+        if cid:
+            return cid
+    return state.get("conversation_id")
+
+
+def _resolve_on_event(state: AgentState, runtime: Runtime) -> OnEvent:
+    """兼容地从 state / runtime.context 读 on_event。"""
+    ctx = getattr(runtime, "context", None) or {}
+    if isinstance(ctx, dict) and ctx.get("on_event"):
+        return ctx["on_event"]
+    return state.get("on_event")
+
 
 class AgentPersistenceMiddleware(AgentMiddleware):
     """统一捕获 agent 执行轨迹、自动落库、可选 SSE 推送。
@@ -81,13 +103,14 @@ class AgentPersistenceMiddleware(AgentMiddleware):
         runtime: Runtime,
     ) -> dict[str, Any] | None:
         """预创建 assistant 消息壳 + 重置本轮 state。"""
-        ctx: dict = runtime.context or {}
-        conversation_id = ctx.get("conversation_id")
+        conversation_id = _resolve_conversation_id(state, runtime)
         if not conversation_id:
+            ctx_repr = getattr(runtime, "context", None) or {}
             raise ValueError(
                 "AgentPersistenceMiddleware.before_agent: "
-                "runtime.context['conversation_id'] is required, "
-                f"got runtime.context={ctx!r}"
+                "conversation_id is required "
+                f"(runtime.context={ctx_repr!r}, "
+                f"state.conversation_id={state.get('conversation_id')!r})"
             )
 
         msg = await self.dao_messages.create_assistant_shell(
@@ -96,7 +119,7 @@ class AgentPersistenceMiddleware(AgentMiddleware):
         self._message_id = msg.id
         self._steps = []
         self._step_counter = 0
-        self._on_event = ctx.get("on_event")
+        self._on_event = _resolve_on_event(state, runtime)
 
         logger.info(
             "agent_middleware.before_agent conversation=%s message=%s",

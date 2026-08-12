@@ -216,7 +216,29 @@ export interface ConversationDetail extends ConversationRecord {
   messages: MessageRecord[];
 }
 
+export interface SceneDraft {
+  index: number;
+  duration_sec: number;
+  description: string;
+  animation: string;
+  text_overlays: string[];
+  math_objects: string[];
+}
+
+export interface ScriptDraft {
+  title: string;
+  concept: string;
+  total_duration_sec: number;
+  style: string;
+  scenes: SceneDraft[];
+}
+
+/** POST /conversations 的 done 事件 payload。
+ *  - status="done"          — 正常出视频完成
+ *  - status="script_ready"  — 脚本阶段等用户确认（assistant_message/code/video 都没）
+ */
 export interface CreateConversationResult {
+  status?: "done" | "script_ready";
   conversation: ConversationRecord;
   message: MessageRecord;
   assistant_message: MessageRecord | null;
@@ -224,6 +246,8 @@ export interface CreateConversationResult {
   video_url: string | null;
   duration_sec: number | null;
   scene_name: string | null;
+  script?: ScriptDraft;
+  need_script?: boolean;
 }
 
 export async function createConversation(
@@ -248,6 +272,22 @@ export async function deleteConversation(id: string): Promise<{ deleted: string 
   return fetchJson<{ deleted: string }>(`/api/v1/conversations/${id}`, {
     method: "DELETE",
   });
+}
+
+/** POST /conversations/{id}/confirm — 用户确认脚本后调，触发 Coder 续跑。 */
+export interface ConfirmConversationResult {
+  code: string;
+  scene_name: string | null;
+  conversation_id: string;
+}
+
+export async function confirmConversation(
+  conversationId: string,
+): Promise<ConfirmConversationResult> {
+  return fetchJson<ConfirmConversationResult>(
+    `/api/v1/conversations/${encodeURIComponent(conversationId)}/confirm`,
+    { method: "POST" },
+  );
 }
 
 // ---------- Few-shot library ----------

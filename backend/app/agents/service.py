@@ -17,14 +17,14 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 from langchain_core.messages import HumanMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.agent_recovery import invoke_with_recovery
 from app.agents.algorithm_extractor import extract_algorithm_name
-from app.agents.builder import build_agent
+from app.agents.supervisor import PHASE_CODING, PHASE_SCRIPTING, build_supervisor
 from app.agents.dao.agent_steps import AgentStepsDAO
 from app.agents.dao.conversations import ConversationsDAO
 from app.agents.dao.messages import MessagesDAO
@@ -41,13 +41,27 @@ OnEvent = Callable[[str, dict], Awaitable[None]] | None
 
 @dataclass(slots=True)
 class AgentRunResult:
-    """Service 跑一次 agent 后的返回值 — 路由层拿到这个再渲染 + 回填。"""
+    """Service 跑一次 agent 后的返回值 — 路由层拿到这个再渲染 + 回填。
+
+    P3 加字段：
+      * phase       — 跑完时 conversation 处于哪个 phase
+      * script      — 当前脚本（scripting 阶段才有，coding 阶段为 None）
+      * need_script — 入口分诊是否判定"需要脚本"（前端弹脚本面板用）
+    
+    P3 修正：``assistant_message`` 在 scripting 阶段可能为 ``None``
+    （Script Designer 停了、Coder 没跑，middleware 没建 assistant 壳）。
+    路由层只会在 ``phase == "coding"`` 时用它；scripting 阶段走
+    ``script_ready`` SSE 分支，不碰 ``assistant_message``。
+    """
     conversation: Conversation
     user_message: Message
-    assistant_message: Message
+    assistant_message: Optional[Message]
     code: str | None
     scene_name: str | None
     error: str | None = None
+    phase: str = PHASE_CODING
+    script: dict | None = None
+    need_script: bool = False
 
 
 def _require_message(
@@ -55,7 +69,10 @@ def _require_message(
     msg: Message | None,
     conversation_id: str,
 ) -> Message:
-    """``abefore_agent`` 一定会建 assistant shell，run 完之后一定能拿到。"""
+    """断言 helper：Coding 阶段（``abefore_agent`` 跑过）assistant 壳必有；
+    Scripting 阶段 Script Designer 停了 Coder 没跑，可能为 None，
+    调用方需自行分支处理（见 ``AgentService.run_initial``）。
+    """
     if msg is None:
         raise RuntimeError(
             f"AgentService: no assistant message after {label} "
@@ -85,15 +102,24 @@ class AgentService:
         style: str,
         few_shots: Sequence[FewShot] = (),
         on_event: OnEvent = None,
+        phase: str = PHASE_SCRIPTING,
     ) -> AgentRunResult:
-        """建会话 + user 消息 → 跑 agent → middleware 自动落库。"""
+        """建会话 + user 消息 → 跑 agent → middleware 自动落库。
+
+        P3 默认 phase=scripting：会先跑 Script Designer 决定要不要
+        出脚本。脚本出完停在这（service 返回 phase=scripting + script
+        字段），路由层把脚本推给用户确认。用户点确认后调
+        ``run_after_confirm`` 续跑（phase=coding）。
+        """
         conv = await self.dao_conv.create(
             prompt=prompt, style=style, user_id=user_id,
         )
+        # 标记 phase
+        await self.dao_conv.set_phase(conv.id, phase)
         user_msg = await self.dao_msg.append_user_message(
             conversation_id=conv.id, content=prompt,
         )
-        assistant_msg = await self._run_agent(
+        assistant_msg, run_state = await self._run_agent(
             style=style,
             few_shots=few_shots,
             on_event=on_event,
@@ -101,14 +127,80 @@ class AgentService:
             user_id=user_id,
             conversation_id=conv.id,
             label="agent.run_initial",
+            phase=phase,
         )
-        assistant = _require_message("run_initial", assistant_msg, conv.id)
+        # 写回 current_script + 切换 phase
+        script = (run_state or {}).get("current_script")
+        final_phase = (run_state or {}).get("phase") or phase
+        await self.dao_conv.update_after_run(
+            conversation_id=conv.id,
+            phase=final_phase,
+            current_script=script,
+        )
+        # P3：scripting 阶段 Script Designer 停了、Coder 没跑，
+        # middleware 没建 assistant 壳 — 不强制要求。
+        # coding 阶段 Coder 一定跑过，assistant_msg 必有。
+        if final_phase == PHASE_SCRIPTING:
+            assistant: Message | None = assistant_msg
+        else:
+            assistant = _require_message(
+                "run_initial", assistant_msg, conv.id,
+            )
         return AgentRunResult(
             conversation=conv,
             user_message=user_msg,
             assistant_message=assistant,
-            code=assistant.code,
-            scene_name=assistant.scene_name,
+            code=assistant.code if assistant is not None else None,
+            scene_name=assistant.scene_name if assistant is not None else None,
+            phase=final_phase,
+            script=script,
+            need_script=bool((run_state or {}).get("need_script", False)),
+        )
+
+    async def run_after_confirm(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        few_shots: Sequence[FewShot] = (),
+        on_event: OnEvent = None,
+    ) -> AgentRunResult:
+        """用户确认脚本后调，phase=coding，跳过 Script Designer 走 Coder。"""
+        # 拿到 conv + 已确认的 script
+        conv = await self.dao_conv.get(conversation_id, user_id=user_id)
+        if conv is None:
+            raise ValueError(f"conversation {conversation_id} not found for user {user_id}")
+        if conv.phase != PHASE_SCRIPTING:
+            raise ValueError(f"conversation {conversation_id} not in scripting phase (current={conv.phase})")
+        # 把 conv.phase 标为 coding（用户已确认）
+        await self.dao_conv.set_phase(conversation_id, PHASE_CODING)
+        prompt_text = (conv.title or "").strip() or "请基于脚本生成动画"
+        assistant_msg, run_state = await self._run_agent(
+            style=conv.style,
+            few_shots=few_shots,
+            on_event=on_event,
+            prompt_text=prompt_text,
+            user_id=user_id,
+            conversation_id=conv.id,
+            label="agent.run_after_confirm",
+            phase=PHASE_CODING,
+        )
+        assistant = _require_message("run_after_confirm", assistant_msg, conv.id)
+        # coding 阶段结束，标 done
+        await self.dao_conv.update_after_run(
+            conversation_id=conv.id,
+            phase=PHASE_CODING,
+            current_script=conv.current_script,
+        )
+        return AgentRunResult(
+            conversation=conv,
+            user_message=None,  # 没新增 user 消息
+            assistant_message=assistant,
+            code=assistant.code if assistant is not None else None,
+            scene_name=assistant.scene_name if assistant is not None else None,
+            phase=PHASE_CODING,
+            script=conv.current_script,
+            need_script=False,
         )
 
     # ------------------------------------------------------------------
@@ -132,7 +224,7 @@ class AgentService:
             conversation_id=conversation_id, content=instruction,
         )
         prompt_text = _build_refine_prompt(prev_code, instruction, user_history)
-        assistant_msg = await self._run_agent(
+        assistant_msg, _ = await self._run_agent(
             style=style,
             few_shots=few_shots,
             on_event=on_event,
@@ -141,6 +233,7 @@ class AgentService:
             conversation_id=conversation_id,
             extra_system_prompt=_REFINE_PREAMBLE,
             label="agent.run_refine",
+            phase=PHASE_CODING,
         )
         conv = await self.dao_conv.get(conversation_id, user_id=user_id)
         if conv is None:
@@ -153,8 +246,8 @@ class AgentService:
             conversation=conv,
             user_message=user_msg,
             assistant_message=assistant,
-            code=assistant.code,
-            scene_name=assistant.scene_name,
+            code=assistant.code if assistant is not None else None,
+            scene_name=assistant.scene_name if assistant is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -215,7 +308,8 @@ class AgentService:
         conversation_id: str,
         extra_system_prompt: str = "",
         label: str = "agent.run",
-    ) -> Message | None:
+        phase: str = PHASE_CODING,
+    ) -> tuple[Message | None, dict | None]:
         """构造 agent → 跑 ``invoke_with_recovery`` → 拿回 middleware 创建的 assistant 消息。
 
         **必须**走 ``invoke_with_recovery`` 而非直接 ``agent.ainvoke`` —— 后者
@@ -243,24 +337,76 @@ class AgentService:
             dao_steps=self.dao_steps,
             dao_messages=self.dao_msg,
         )
-        agent = build_agent(
+        # P3：phase 必须传给 build_supervisor，否则图默认 PHASE_SCRIPTING，
+        # confirm 路径传 PHASE_CODING 也被忽略 — 还是会先跑 script_decision，
+        # Coder 没机会跑，_require_message 抛 RuntimeError。
+        supervisor = build_supervisor(
             style_id=style,
             extra_system_prompt=full_extra_prompt,
             few_shots=list(few_shots),
             middleware=[middleware],
+            phase=phase,
         )
-        recovered = await invoke_with_recovery(
-            agent,
-            {"messages": [HumanMessage(content=prompt_text)]},
-            max_iterations=8,
-            label=label,
-            style_id=style,
-            context={
-                "conversation_id": conversation_id,
-                "on_event": on_event,
-            },
-        )
-        recovered_code: str | None = recovered.get("code") if recovered else None
+        # Supervisor 走 state 路径：conversation_id / on_event 塞进 state，
+        # 因为 Supervisor 把 worker 当 subgraph 调用时 runtime.context 不会
+        # 透传。同时也通过 context 参数传一份，老路径仍能拿到。
+        supervisor_input = {
+            "messages": [HumanMessage(content=prompt_text)],
+            "conversation_id": conversation_id,
+            "on_event": on_event,
+            "code_round": 0,
+        }
+        # P2 Supervisor 是 StateGraph 图，Coder / Reviewer 都是 node。
+        # Coder 内部已自带 ``invoke_with_recovery`` 兜底（4 层 + 3 次重试），
+        # 所以这里不用再包一层，直接 ainvoke 即可。
+        try:
+            final_state = await supervisor.ainvoke(
+                supervisor_input,
+                config={"recursion_limit": 30},
+                context={
+                    "conversation_id": conversation_id,
+                    "on_event": on_event,
+                },
+            )
+        except Exception as exc:
+            # 任何 supervisor.ainvoke 异常（middleware ValueError / LLM /
+            # 工具调用失败 / DB 失败）都先把 session rollback 救回来，
+            # 再把 assistant 消息标 failed，避免下一次写入踩
+            # InFailedSQLTransactionError 整个请求挂掉。
+            try:
+                await self.session.rollback()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "service._run_agent.rollback_failed conversation=%s",
+                    conversation_id,
+                )
+            assistant_msg = await self._get_assistant_after_agent(
+                conversation_id,
+            )
+            if assistant_msg is not None:
+                await self.dao_msg.mark_failed(
+                    message_id=assistant_msg.id,
+                    status="failed",
+                    content="生成失败",
+                    error=str(exc)[:1000],
+                )
+                await self.session.commit()
+            logger.exception(
+                "service._run_agent.failed conversation=%s err=%s",
+                conversation_id, exc,
+            )
+            raise
+        # P3 state：code / thought / scene_name / review / code_round / script / phase
+        recovered_code: str | None = (final_state or {}).get("code") or None
+        final_review = (final_state or {}).get("review")
+        rounds = int((final_state or {}).get("code_round", 0))
+
+        # 记 P2 审查结果到日志（不在 DB 里持久化，调试用）
+        if final_review is not None:
+            logger.info(
+                "service.p2.review conversation=%s rounds=%d ok=%s feedback_len=%d",
+                conversation_id, rounds, final_review.ok, len(final_review.feedback or ""),
+            )
 
         # middleware 的 ``aafter_agent`` 已经按 ``state["structured_response"]``
         # 写过一次 assistant 行。如果有 recovered code，需要再写一次把它从
@@ -285,7 +431,7 @@ class AgentService:
             code=recovered_code,
             status="ok" if recovered_code else "failed",
         )
-        return assistant_msg
+        return assistant_msg, final_state
 
     def _schedule_memory_curator(
         self,

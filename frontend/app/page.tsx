@@ -7,18 +7,20 @@ import {
   MessageRecord,
   STYLES,
   StyleId,
+  confirmConversation,
   createConversation,
   getConversation,
   saveAsFewShot,
   subscribeCreateConversation,
   subscribeRefine,
+  ScriptDraft,
 } from "@/lib/api";
 
 import { HistorySidebar } from "@/components/HistorySidebar";
 import { CodeViewer } from "@/components/CodeViewer";
 import { ConversationPanel } from "@/components/ConversationPanel";
 
-type Status = "idle" | "creating" | "generating" | "rendering" | "done" | "failed";
+type Status = "idle" | "creating" | "generating" | "rendering" | "done" | "failed" | "script_ready";
 
 /** 单条步骤日志条目，对应后端一次 SSE 事件。 */
 type Step = {
@@ -137,6 +139,10 @@ export default function Page() {
   const [style, setStyle] = useState<StyleId>("3b1b");
   /** 步骤日志：每次新请求（创建 / refine）开始前清空。 */
   const [steps, setSteps] = useState<Step[]>([]);
+  /** P3 脚本确认面板 — 非空时主区域显示脚本 + 确认/修改按钮。 */
+  const [pendingScript, setPendingScript] = useState<
+    { conversationId: string; script: ScriptDraft } | null
+  >(null);
 
   // sidebar refresh trigger — bumped after any successful op
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
@@ -165,6 +171,7 @@ export default function Page() {
     setStatus("idle");
     setStatusLabel("");
     setSteps([]);
+    setPendingScript(null);
   }
 
   function handleNew() {
@@ -282,6 +289,21 @@ export default function Page() {
         ...stepHandlers,
         started: () => setStatusLabel("开始生成…"),
         done: async (created) => {
+          // P3：脚本确认分支 — 后端先发 script_ready 再发 done(status=script_ready)
+          if (created.status === "script_ready" && created.script) {
+            setActiveConversation({
+              ...created.conversation,
+              messages: [created.message],
+            });
+            setPendingScript({
+              conversationId: created.conversation.id,
+              script: created.script,
+            });
+            setStatus("script_ready");
+            setStatusLabel("脚本待确认");
+            setHistoryRefreshKey((k) => k + 1);
+            return;
+          }
           const durationSec = created?.duration_sec ?? undefined;
           stepHandlers.finalizeRendering?.(durationSec);
           const fresh = await getConversation(created.conversation.id);
@@ -301,6 +323,33 @@ export default function Page() {
     );
     abortRef.current = sub.unsubscribe;
     return sub.result;
+  }
+
+  async function handleConfirmScript() {
+    if (!pendingScript) return;
+    const cid = pendingScript.conversationId;
+    setStatus("generating");
+    setStatusLabel("基于脚本生成代码…");
+    setPendingScript(null);
+    try {
+      const r = await confirmConversation(cid);
+      const fresh = await getConversation(cid);
+      setActiveConversation(fresh);
+      setStatus("done");
+      setStatusLabel("脚本已确认，生成完成");
+      setHistoryRefreshKey((k) => k + 1);
+      return r;
+    } catch (e) {
+      setStatus("failed");
+      setStatusLabel("脚本确认后生成失败");
+      setError((e as Error).message);
+    }
+  }
+
+  function handleRejectScript() {
+    setPendingScript(null);
+    setStatus("idle");
+    setStatusLabel("");
   }
 
   async function handleRefine(instruction: string) {
@@ -370,7 +419,13 @@ export default function Page() {
       <div className="flex min-w-0 flex-1 flex-col gap-3">
         <Header style={style} setStyle={setStyle} />
 
-        {activeConversation ? (
+        {pendingScript ? (
+          <ScriptReviewPanel
+            script={pendingScript.script}
+            onConfirm={handleConfirmScript}
+            onReject={handleRejectScript}
+          />
+        ) : activeConversation ? (
           <CodeViewer
             videoUrl={currentVideo}
             code={currentCode}
@@ -422,6 +477,71 @@ function EmptyState() {
         例如：冒泡排序、二分查找、梯形面积、勾股定理…
       </p>
     </div>
+  );
+}
+
+function ScriptReviewPanel({
+  script,
+  onConfirm,
+  onReject,
+}: {
+  script: ScriptDraft;
+  onConfirm: () => void;
+  onReject: () => void;
+}) {
+  return (
+    <section className="flex flex-1 flex-col rounded-lg border border-gray-800 bg-gray-900 p-4">
+      <div className="mb-3 flex items-start justify-between">
+        <div>
+          <h2 className="text-lg font-semibold text-blue-400">
+            📜 脚本预览 — {script.title}
+          </h2>
+          <p className="mt-1 text-xs text-gray-400">{script.concept}</p>
+          <p className="mt-1 text-[10px] text-gray-500">
+            共 {script.scenes.length} 镜 · 总时长 {script.total_duration_sec}s ·
+            风格 {script.style}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={onReject}
+            className="rounded border border-gray-700 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-800"
+          >
+            改一下
+          </button>
+          <button
+            onClick={onConfirm}
+            className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500"
+          >
+            确认并生成
+          </button>
+        </div>
+      </div>
+      <div className="flex-1 space-y-2 overflow-y-auto pr-1">
+        {script.scenes.map((s) => (
+          <div
+            key={s.index}
+            className="rounded border border-gray-800 bg-gray-950/60 p-3 text-xs"
+          >
+            <div className="mb-1 flex items-center justify-between text-gray-400">
+              <span className="font-medium text-gray-300">
+                第 {s.index + 1} 镜 · {s.duration_sec}s
+              </span>
+              <span className="text-[10px] text-gray-600">
+                {s.math_objects.join(" · ") || "—"}
+              </span>
+            </div>
+            <div className="mb-1 text-gray-200">视觉：{s.description}</div>
+            <div className="mb-1 text-gray-400">动画：{s.animation}</div>
+            {s.text_overlays.length > 0 && (
+              <div className="mt-1 text-[11px] text-blue-300">
+                文字：{s.text_overlays.join(" / ")}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
