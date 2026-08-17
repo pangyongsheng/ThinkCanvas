@@ -25,6 +25,8 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://thinkcanvas:thinkcanvas@localhost:5432/thinkcanvas"
     )
 
+    redis_url: str = "redis://localhost:6379/0"
+
     # LLM — all model-format quirks (MiniMax thinking blocks, tool-call
     # tags, etc.) are handled by embedded LiteLLM (via langchain-litellm);
     # this layer only holds endpoint / credentials / generation params.
